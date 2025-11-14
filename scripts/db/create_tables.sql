@@ -427,25 +427,223 @@ CREATE TABLE trade (
   book_id        TEXT REFERENCES book(book_id),
   ccy            TEXT NOT NULL REFERENCES currency(ccy),          -- 報告/換算通貨
   notional       REAL NOT NULL,
-  direction      INTEGER NOT NULL CHECK(direction IN (-1,1)),
-  json_body      TEXT NOT NULL,                                   -- 商品固有項目（JSON1）
-  trade_date     TEXT NOT NULL,
-  effective_date TEXT,
-  maturity_date  TEXT,
-  is_active      INTEGER NOT NULL DEFAULT 1,
-  valid_from     TEXT NOT NULL,
-  created_at     TEXT NOT NULL,
+  direction       INTEGER NOT NULL CHECK (direction IN (-1,1)),  -- 単レグ商品の早見符号
+  trade_date      TEXT NOT NULL,
+  effective_date  TEXT,
+  maturity_date   TEXT,
+  status          TEXT CHECK (status IN (
+                      'NEW','AMENDED','CANCELLED','EXERCISED','EXPIRED','NOVATED')),
+  version_no      INTEGER,
+  parent_trade_id TEXT REFERENCES trade(trade_id),
+  replaced_by_trade_id TEXT REFERENCES trade(trade_id),
+  is_active       INTEGER NOT NULL DEFAULT 1,
+  external_id     TEXT,
+  counterparty    TEXT,
+  cleared_flag    INTEGER DEFAULT 0,
+  clearing_house  TEXT,
+  csa_id          TEXT,
+  netting_set_id  TEXT,
+  pricing_profile_id TEXT,
+  trader          TEXT,
+  sales           TEXT,
+  strategy_tag    TEXT,
+  valid_from      TEXT NOT NULL,
+  created_at      TEXT NOT NULL,
+  updated_at      TEXT,
+  closed_at       TEXT,
+  canceled_at     TEXT,
+  source_tag      TEXT
+);
+CREATE INDEX IF NOT EXISTS idx_trade_product ON trade(product);
 
-  -- 監査補助
-  external_id    TEXT,                                            -- 外部ID（任意）
-  counterparty   TEXT                                             -- 相手先（任意）
+/* ============ 商品別：IRS ============ */
+CREATE TABLE IF NOT EXISTS trade_irs (
+  trade_id         TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  pay_rec          TEXT NOT NULL CHECK (pay_rec IN ('PAY','REC')),   -- 固定側の支払/受取
+  fixed_rate       REAL NOT NULL,
+  fixed_daycount   TEXT NOT NULL REFERENCES daycount(code),
+  fixed_freq       TEXT NOT NULL,                                    -- '1Y','6M','3M' 等
+  fixed_bdc        TEXT NOT NULL REFERENCES bizday_convention(code),
+  fixed_cal_id     TEXT NOT NULL REFERENCES calendar_def(cal_id),
+
+  float_index_id   TEXT NOT NULL REFERENCES ref_rate_rule(index_id),
+  float_spread     REAL NOT NULL DEFAULT 0.0,
+  float_daycount   TEXT NOT NULL REFERENCES daycount(code),
+  float_freq       TEXT NOT NULL,
+  float_bdc        TEXT NOT NULL REFERENCES bizday_convention(code),
+  float_cal_id     TEXT NOT NULL REFERENCES calendar_def(cal_id),
+
+  stub_type        TEXT,                                             -- 'FRONT','BACK','BOTH' など（必要ならCHECK拡張）
+  amortizing_json  TEXT,
+  settle_ccy       TEXT REFERENCES currency(ccy)
 );
 
-CREATE INDEX IF NOT EXISTS idx_trade_product      ON trade(product);
-CREATE INDEX IF NOT EXISTS idx_trade_book         ON trade(book_id);
-CREATE INDEX IF NOT EXISTS idx_trade_json_pair    ON trade((json_extract(json_body,'$.pair')));
-CREATE INDEX IF NOT EXISTS idx_trade_json_indexid ON trade((json_extract(json_body,'$.float_leg.index_id')));
 
+/* ============ 債券（固定・変動・ゼロを統合） ============ */
+CREATE TABLE IF NOT EXISTS trade_bond (
+  trade_id        TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+
+  /* 債券タイプ */
+  coupon_type     TEXT NOT NULL CHECK (coupon_type IN ('FIX','FLOAT','ZC')),
+
+  /* 固定債フィールド（coupon_type='FIX' で必須） */
+  coupon_rate     REAL,                                              -- 年率
+  coupon_daycount TEXT REFERENCES daycount(code),
+  coupon_freq     TEXT,                                              -- '1Y','6M','3M' 等
+  coupon_bdc      TEXT REFERENCES bizday_convention(code),
+  coupon_cal_id   TEXT REFERENCES calendar_def(cal_id),
+
+  /* 変動債フィールド（coupon_type='FLOAT' で必須） */
+  float_index_id  TEXT REFERENCES ref_rate_rule(index_id),
+  float_spread    REAL,                                              -- 年率
+
+  /* 共通（ZC含む） */
+  issuer          TEXT,
+  redemption      REAL NOT NULL DEFAULT 100.0,                       -- 額面＝100 を仮定
+  settlement_ccy  TEXT NOT NULL REFERENCES currency(ccy),
+
+  /* 整合チェック（SQLite の CHECK で条件付き必須を担保） */
+  CHECK (
+    (coupon_type='FIX'   AND coupon_rate IS NOT NULL
+                         AND coupon_daycount IS NOT NULL
+                         AND coupon_freq IS NOT NULL
+                         AND coupon_bdc IS NOT NULL
+                         AND coupon_cal_id IS NOT NULL
+                         AND float_index_id IS NULL
+                         AND float_spread IS NULL)
+    OR
+    (coupon_type='FLOAT' AND float_index_id IS NOT NULL
+                         AND float_spread IS NOT NULL
+                         AND coupon_daycount IS NOT NULL
+                         AND coupon_freq IS NOT NULL
+                         AND coupon_bdc IS NOT NULL
+                         AND coupon_cal_id IS NOT NULL
+                         AND coupon_rate IS NULL)
+    OR
+    (coupon_type='ZC'    AND coupon_rate IS NULL
+                         AND float_index_id IS NULL
+                         AND float_spread IS NULL
+                         /* ZC は daycount/freq 不要 */
+                         )
+  )
+);
+
+
+/* ============ FX フォワード（据え置き） ============ */
+CREATE TABLE IF NOT EXISTS trade_fxfwd (
+  trade_id        TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  base_ccy        TEXT NOT NULL REFERENCES currency(ccy),
+  quote_ccy       TEXT NOT NULL REFERENCES currency(ccy),
+  pair            TEXT NOT NULL,
+  deliver_date    TEXT NOT NULL,
+  forward_rate    REAL NOT NULL,
+  settle_bdc      TEXT NOT NULL REFERENCES bizday_convention(code),
+  deliver_cal_id  TEXT NOT NULL REFERENCES calendar_def(cal_id),
+  pay_rec_base    TEXT NOT NULL CHECK (pay_rec_base IN ('PAY','REC'))
+);
+
+
+/* ============ 通貨オプション（バニラ＋バリアを統合） ============ */
+CREATE TABLE IF NOT EXISTS trade_fxopt (
+  trade_id        TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  base_ccy        TEXT NOT NULL REFERENCES currency(ccy),
+  quote_ccy       TEXT NOT NULL REFERENCES currency(ccy),
+  pair            TEXT NOT NULL,
+
+  /* バニラ共通 */
+  cp_flag         TEXT NOT NULL CHECK (cp_flag IN ('C','P')),                           -- Call/Put
+  option_style    TEXT NOT NULL CHECK (option_style IN ('EUROPEAN','AMERICAN','BERMUDAN')),
+  strike          REAL NOT NULL,
+  expiry_date     TEXT NOT NULL,
+  settlement      TEXT NOT NULL CHECK (settlement IN ('PHYS','CASH')),
+  premium_ccy     TEXT REFERENCES currency(ccy),
+  premium_amount  REAL,
+  deliver_cal_id  TEXT REFERENCES calendar_def(cal_id),
+  exercise_cal_id TEXT REFERENCES calendar_def(cal_id),
+
+  /* バリア拡張（該当しない場合は NULL） */
+  barrier_type    TEXT CHECK (barrier_type IN ('KI','KO')),
+  barrier_dir     TEXT CHECK (barrier_dir  IN ('UP','DOWN')),
+  barrier_level   REAL,
+  rebate_type     TEXT CHECK (rebate_type IN ('AT_HIT','AT_EXPIRY')),
+  rebate_ccy      TEXT REFERENCES currency(ccy),
+  rebate_amount   REAL,
+  monitoring_cal_id TEXT REFERENCES calendar_def(cal_id),
+
+  /* 整合チェック：バリア指定の有無で一貫性を担保（簡易） */
+  CHECK (
+    (barrier_type IS NULL AND barrier_dir IS NULL AND barrier_level IS NULL
+                          AND rebate_type IS NULL AND rebate_ccy IS NULL AND rebate_amount IS NULL)
+    OR
+    (barrier_type IS NOT NULL AND barrier_dir IS NOT NULL AND barrier_level IS NOT NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_fxopt_pair_expiry ON trade_fxopt(pair, expiry_date);
+
+
+/* ============ Cap/Floor（据え置き） ============ */
+CREATE TABLE IF NOT EXISTS trade_capfloor (
+  trade_id        TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  ccy             TEXT NOT NULL REFERENCES currency(ccy),
+  cp_flag         TEXT NOT NULL CHECK (cp_flag IN ('C','P')),        -- 'C'=Cap, 'P'=Floor
+  index_id        TEXT NOT NULL REFERENCES ref_rate_rule(index_id),
+  index_tenor     TEXT NOT NULL,
+  strike_rate     REAL NOT NULL,
+  start_date      TEXT NOT NULL,
+  end_date        TEXT NOT NULL,
+  pay_rec         TEXT NOT NULL CHECK (pay_rec IN ('PAY','REC')),
+  pay_freq        TEXT NOT NULL,
+  pay_bdc         TEXT NOT NULL REFERENCES bizday_convention(code),
+  pay_cal_id      TEXT NOT NULL REFERENCES calendar_def(cal_id)
+);
+
+
+/* ============ Swaption（EU/AM/BER を 1 テーブルで表現） ============ */
+CREATE TABLE IF NOT EXISTS trade_swaption (
+  trade_id          TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  ccy               TEXT NOT NULL REFERENCES currency(ccy),
+
+  /* 行使スタイル＋ payer/receiver 軸 */
+  option_style      TEXT NOT NULL CHECK (option_style IN ('EUROPEAN','AMERICAN','BERMUDAN')),
+  cp_flag           TEXT NOT NULL CHECK (cp_flag IN ('C','P')),      -- 'C'=payer, 'P'=receiver（慣用）
+
+  /* 満期・行使情報 */
+  expiry_date       TEXT NOT NULL,                                   -- EU では権利行使日
+  exercise_open     TEXT,                                            -- AM：行使開始（通常は取引発効）
+  exercise_close    TEXT,                                            -- AM：行使終了（=expiry_date など）
+  bermudan_dates_json TEXT,                                          -- BER：行使可能日配列（JSON: ["2027-06-15", ...]）
+
+  settlement        TEXT NOT NULL CHECK (settlement IN ('PHYS','CASH')),
+
+  /* 基底スワップ規約（固定レグ） */
+  swap_pay_rec      TEXT NOT NULL CHECK (swap_pay_rec IN ('PAY','REC')),
+  swap_fixed_rate   REAL,                                            -- ATMF なら NULL
+  swap_fixed_dc     TEXT NOT NULL REFERENCES daycount(code),
+  swap_fixed_freq   TEXT NOT NULL,
+  swap_fixed_bdc    TEXT NOT NULL REFERENCES bizday_convention(code),
+  swap_fixed_cal    TEXT NOT NULL REFERENCES calendar_def(cal_id),
+
+  /* 基底スワップ規約（変動レグ） */
+  swap_index_id     TEXT NOT NULL REFERENCES ref_rate_rule(index_id),
+  swap_index_tenor  TEXT NOT NULL,
+  swap_spread       REAL NOT NULL DEFAULT 0.0,
+  swap_float_dc     TEXT NOT NULL REFERENCES daycount(code),
+  swap_float_freq   TEXT NOT NULL,
+  swap_float_bdc    TEXT NOT NULL REFERENCES bizday_convention(code),
+  swap_float_cal    TEXT NOT NULL REFERENCES calendar_def(cal_id),
+
+  swap_maturity     TEXT NOT NULL,
+
+  /* 整合チェック（簡易）：スタイル別の行使情報の有無 */
+  CHECK (
+    (option_style='EUROPEAN' AND exercise_open IS NULL AND exercise_close IS NULL)
+    OR
+    (option_style='AMERICAN' AND exercise_open IS NOT NULL AND exercise_close IS NOT NULL AND bermudan_dates_json IS NULL)
+    OR
+    (option_style='BERMUDAN' AND bermudan_dates_json IS NOT NULL AND exercise_open IS NULL AND exercise_close IS NULL)
+  )
+);
+CREATE INDEX IF NOT EXISTS idx_swaption_expiry ON trade_swaption(expiry_date);
 
 /* =========================
    評価実行
