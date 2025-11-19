@@ -21,6 +21,8 @@
 #### プロダクト
 - IRS(固定vs変動)
 - 債券(固定債、変動債、割引債)
+- 金利先物
+- FRA
 - FXフォワード
 - ヨーロピアンFXオプション
 - Cap/Floor
@@ -30,6 +32,7 @@
 #### 通貨
 - JPY
 - USD
+- EUR
 #### 単位
 - 通貨は取引に準ずる
 - レートは実数
@@ -46,8 +49,11 @@
 #### 精度
 - float64
 #### モデル
+市場で価格がクォートされている場合はその価格に合わせるようにキャリブレーションする。
 - IRS(固定vs変動) : DCF法
 - 債券(固定債、変動債、割引債) : DCF法
+- 金利先物：DCF法
+- FRA：DCF法
 - FXフォワード : カバード金利平価
 - ヨーロピアンFXオプション : Garman–Kohlhagen（Black, lognormal）
 - Cap/Floor : Black caplet(Shift付)
@@ -60,13 +66,13 @@
 #### src/pyquant/data
 - sources/（CSV/DB/API アダプタ）、models/（Pydantic/SQLAlchemy）、transformers/。マーケットデータ・取引データの取り込みと検証を一箇所で管理。
 #### src/pyquant/market
-- curves/（interpolation/, discount.py, forward.py, bootstrap.py）、vol/（volatility surface）、fx/（為替レート）。キャリブレーションや更新ロジックもここに集める。
+- curves/（例：interpolation/, discount.py, forward.py, bootstrap.py）、vol/（volatility surface）、fx/（為替レート）。キャリブレーションや更新ロジックもここに集める。
 #### src/pyquant/instruments
-- rates/（IRS, Bond, Cap/Floor など）、fx/（FX Forward/Option）、将来の credit/, equity/。各取引のドメインモデルとleg生成、キャッシュフロー計算をまとめる。
+- rates/（IRS, Bond, 金利先物, FRA, Cap/Floor など）、fx/（FX Forward/Option）、将来の credit/, equity/。各取引のドメインモデルとleg生成、キャッシュフロー計算をまとめる。
 #### src/pyquant/analytics
 - pv/（プライシングエンジン：例 pv/irs.py）、risk/（Greek, DV01, Vega）、cva/, simulation/（MC, シナリオ）、common/（数値計算法、線形代数、ルート検索など）。高速化のための NumPy/SciPy 実装やJITをここで集中管理する。
 #### src/pyquant/portfolio
-- positions.py, portfolio.py, aggregation.py, reports/。ミドル／バック業務を意識したバッチ評価やレポーティングの入り口。
+- ミドル／バック業務を意識したバッチ評価やレポーティングの入り口。
 #### src/pyquant/workflows
 - ジョブ定義、CLI/cron 連携、パイプライン制御。EODやシミュレーションのオーケストレーションを担う。
 #### src/pyquant/utils
@@ -74,7 +80,7 @@
 #### scripts/
 - データ初期化、デモ評価、メンテナンススクリプト。ライブラリ本体とは分離。
 #### tests/
-- core/, market/, instruments/, analytics/, portfolio/ など、実装に合わせたミラーツリー構成。pytest で単体・統合・回帰を整理。
+- 実装に合わせたミラーツリー構成。pytest で単体・統合・回帰を整理。
 #### doc
 - 各種設計書や仕様書などのドキュメント。
 #### notebooks/

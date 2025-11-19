@@ -2,14 +2,37 @@ PRAGMA foreign_keys = ON;
 PRAGMA journal_mode = WAL;
 
 /********** 0) 列挙マスタ **********/
+CREATE TABLE IF NOT EXISTS m_calendar_role (
+  role         TEXT PRIMARY KEY,            -- 例: 'DEFAULT','SETTLEMENT','HOLIDAY_ONLY','FIXING',...
+  description  TEXT,                        -- 用途の説明
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+-- INSERT OR IGNORE INTO m_calendar_role (role, display_name, description, precedence)
+-- VALUES
+--   ('DEFAULT',       'Default',        '通貨の一般業務用の既定カレンダー（非FXのスケジュール生成等）',            100),
+--   ('SETTLEMENT',    'Settlement',     '決済用途（FXのSpot/T+N、受渡日、行使・決済日の共通営業日ANDなど）',         100),
+--   ('HOLIDAY_ONLY',  'Holiday Only',   '休業日集合のみ参照（営業日ロールには使用しないUI/検証用）',                 200),
+--   ('FIXING',        'Rate Fixing',    'Fixing/観測日用途の既定カレンダー（必要になったら利用）',                   150),
+--   ('EXCHANGE',      'Exchange',       '上場商品の取引所カレンダー（限月・最終売買日など）',                         150),
+--   ('CLEARING',      'Clearing',       '清算機関（CCP）業務日カレンダー（証拠金や清算関連）',                       150),
+--   ('DELIVERY',      'Physical Delivery','現物受渡拠点に紐づくカレンダー（コモディティ等で使用）',                  150);
+
+
 CREATE TABLE m_interp_method (
   interp_method TEXT PRIMARY KEY  -- 'LOG_LINEAR_DF','LINEAR_ZERO','PIECEWISE_CONST_FWD','CUBIC_SPLINE_ZERO'
+  description  TEXT,              -- 用途の説明
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE m_extrap_method (
-  extrap_method TEXT PRIMARY KEY  -- 'FLAT_FWD','FLAT_ZERO','LINEAR_ZERO'
+  extrap_method TEXT PRIMARY KEY  -- 'FLAT_FWD','FLAT_ZERO','LINEAR_ZERO'など
+  description  TEXT,              -- 用途の説明
+  created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE m_trade_product (
-  product TEXT PRIMARY KEY  -- 'IRS','BOND_FIXED','BOND_FLOAT','BOND_ZC','FXFWD','FXOPT_EU','CAPFLOOR','SWAPTION_EU'
+  product      TEXT PRIMARY KEY  -- 'IRS','BOND_FIXED','BOND_FLOAT','BOND_ZC'など
+  description  TEXT,              -- 用途の説明
+  created_at   TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 /********** 1) 参照データ **********/
@@ -20,18 +43,20 @@ CREATE TABLE currency (
   minor_unit INTEGER NOT NULL,          -- 小数桁: JPY=0, USD=2
   symbol TEXT,                          -- '¥', '$'
   spot_lag INTEGER NOT NULL DEFAULT 2,  -- FXスポット決済ラグ（営業日）
-  default_cal_id TEXT,                  -- 既定カレンダーID（例: 'JPTO','USNY')
   enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
   valid_from TEXT NOT NULL,             -- 'YYYY-MM-DD'
   retired_at TEXT,                      -- 廃止日
   created_at TEXT NOT NULL              -- 作成UTC
 );
 
-CREATE TABLE currency_calendar ( -- 任意：複数暦の紐付け
-  ccy TEXT NOT NULL REFERENCES currency(ccy),
-  cal_id TEXT NOT NULL,
-  role TEXT NOT NULL CHECK(role IN ('DEFAULT','SETTLEMENT','HOLIDAY_ONLY')),
-  PRIMARY KEY (ccy, cal_id, role)
+CREATE TABLE IF NOT EXISTS currency_calendar (
+  ccy        TEXT NOT NULL REFERENCES currency(ccy),
+  role       TEXT NOT NULL REFERENCES m_calendar_role(role) ON UPDATE CASCADE ON DELETE RESTRICT,
+  cal_id     TEXT NOT NULL REFERENCES calendar_def(cal_id),
+  enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
+  created_at TEXT NOT NULL,
+  PRIMARY KEY (ccy, role),                  -- 1通貨×1役割 = 1行を基本とする
+  UNIQUE (ccy, role, cal_id)                -- 同一通貨・役割で同一カレンダーを重複登録しない
 );
 
 CREATE TABLE daycount (
@@ -97,7 +122,7 @@ CREATE TABLE ref_rate_rule (
   enabled INTEGER NOT NULL DEFAULT 1,
   valid_from TEXT NOT NULL,
   retired_at TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 /********** 2) マーケット・スナップショット **********/
@@ -111,7 +136,7 @@ CREATE TABLE market_snapshot (
   is_locked           INTEGER NOT NULL DEFAULT 1,               -- 1=ロック済（以後不変の想定）
   qa_status           TEXT CHECK(qa_status IN ('PENDING','APPROVED','REJECTED')), -- 品質審査状態
   note                TEXT,                                     -- 補足
-  frozen_at           TEXT,                                     -- 当版を“凍結”したUTC時刻（EOD確定の実瞬間）
+  locked_at           TEXT,                                     -- 当版をロックしたUTC時刻（EOD確定の時刻）
   created_at          TEXT NOT NULL                              -- 生成UTC
 );
 CREATE UNIQUE INDEX ux_market_snapshot_hash ON market_snapshot(data_hash);
@@ -136,6 +161,7 @@ CREATE TABLE fx_spot (
   is_cross_derived INTEGER NOT NULL DEFAULT 0,               -- 1=クロス導出（例: EURJPY = EURUSD*USDJPY）
   derived_via_1    TEXT,                                     -- 由来ペア1（例: 'EURUSD'）
   derived_via_2    TEXT,                                     -- 由来ペア2（例: 'USDJPY'）
+  created_at       TEXT NOT NULL,
   /* クロス導出時のみ由来ペアを要求（運用上の一貫性チェック） */
   CHECK ( (is_cross_derived = 0) OR (derived_via_1 IS NOT NULL AND derived_via_2 IS NOT NULL) ),
 
@@ -183,6 +209,7 @@ CREATE TABLE pricing_curve_def (
   valid_to      TEXT,
 
   description   TEXT,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 
   /* 同一キー空間での重複ガード。FORECAST 以外は ref_rate_id が NULL になる仕様 */
   UNIQUE (ccy, curve_type, IFNULL(ref_rate_id,''), valid_to)
@@ -225,6 +252,71 @@ CREATE INDEX IF NOT EXISTS ix_curve_point_curve_x
 
 CREATE INDEX IF NOT EXISTS ix_curve_point_snapshot_curve
   ON curve_point (snapshot_id, curve_id);
+
+CREATE TABLE IF NOT EXISTS market_ir_futures (
+  snapshot_id        TEXT NOT NULL REFERENCES market_snapshot(snapshot_id) ON DELETE CASCADE,
+  fut_code           TEXT NOT NULL REFERENCES ir_futures_def(fut_code),
+  contract_month     TEXT NOT NULL,                          -- 'YYYY-MM'
+  price              REAL NOT NULL,                          -- 現在値（PRICE or RATE；ir_futures_def.quote_convで解釈）
+  bid                REAL,
+  ask                REAL,
+  source_symbol      TEXT,                                   -- ベンダ銘柄ID
+  created_at         TEXT NOT NULL,                          
+  PRIMARY KEY (snapshot_id, fut_code, contract_month)
+);
+
+CREATE TABLE IF NOT EXISTS bond_def (
+  security_id        TEXT PRIMARY KEY,                         -- 社内一意ID（文字列）
+  isin               TEXT UNIQUE,                              -- 国際証券識別子（任意）
+  local_code         TEXT,                                     -- JGB銘柄コード等（任意）
+  name               TEXT NOT NULL,                            -- 表示名（発行体＋クーポン＋満期など）
+  issuer             TEXT,                                     -- 発行体名（マスタ分割は将来でも可）
+  ccy                TEXT NOT NULL REFERENCES currency(ccy),   -- 券面通貨
+  coupon_type        TEXT NOT NULL CHECK (coupon_type IN ('FIX','FLOAT','ZC')),
+  -- 固定債属性（coupon_type='FIX'）
+  coupon_rate        REAL,                                     -- 年率（%表現ではなく実数、例 0.01）
+  -- 変動債属性（coupon_type='FLOAT'）
+  float_index_id     TEXT REFERENCES ref_rate_rule(index_id),
+  float_spread       REAL,                                     -- 年率（実数）
+  -- 共通の支払規約
+  coupon_daycount    TEXT REFERENCES daycount(code),
+  coupon_freq        TEXT,                                     -- '1Y','6M','3M' 等
+  coupon_bdc         TEXT REFERENCES bizday_convention(code),
+  coupon_cal_id      TEXT REFERENCES calendar_def(cal_id),
+
+  redemption         REAL NOT NULL DEFAULT 100.0,              -- 額面償還（%基準、通常100）
+  issue_date         TEXT,                                     -- 発行日
+  maturity_date      TEXT NOT NULL,                            -- 満期日
+  first_coupon_date  TEXT,                                     -- 初回クーポン（stub時）
+  last_coupon_date   TEXT,                                     -- 最終クーポン（必要なら）
+
+  settlement_days    INTEGER DEFAULT 2,                        -- 約定から決済までの営業日ラグ（T+2 等）
+  prospectus_uri     TEXT,                                     -- 目論見書, term sheet 参照（任意）
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at         TEXT
+  CHECK (
+    (coupon_type='FIX'   AND coupon_rate IS NOT NULL)
+    OR
+    (coupon_type='FLOAT' AND float_index_id IS NOT NULL AND float_spread IS NOT NULL)
+    OR
+    (coupon_type='ZC'    AND coupon_rate IS NULL AND float_index_id IS NULL AND float_spread IS NULL)
+  )
+);
+
+CREATE TABLE IF NOT EXISTS market_bond_price (
+  snapshot_id   TEXT NOT NULL REFERENCES market_snapshot(snapshot_id) ON DELETE CASCADE,
+  security_id   TEXT NOT NULL REFERENCES bond_def(security_id),
+  clean_price   REAL,
+  dirty_price   REAL,
+  yield_to_mty  REAL,
+  bid           REAL,
+  ask           REAL,
+  quote_ccy     TEXT REFERENCES currency(ccy),
+  source_symbol TEXT,
+  frozen_at     TEXT,
+  PRIMARY KEY (snapshot_id, security_id)
+);
+CREATE INDEX IF NOT EXISTS idx_mkt_bond_price_ccy ON market_bond_proce(quote_ccy);
 
 
 /* FX インプライド・ボラティリティ（Garman–Kohlhagen 等で使用） */
@@ -299,10 +391,8 @@ ON vol_fx(
   COALESCE(strike,-1.0),
   quote_type
 );
-
 CREATE INDEX IF NOT EXISTS ix_vol_fx_pair_expiry
   ON vol_fx (pair, COALESCE(expiry_date, ''), COALESCE(expiry_tenor, ''));
-
 
 /* =========================
    Cap/Floor ボラティリティ
@@ -478,56 +568,40 @@ CREATE TABLE IF NOT EXISTS trade_irs (
   settle_ccy       TEXT REFERENCES currency(ccy)
 );
 
-
-/* ============ 債券（固定・変動・ゼロを統合） ============ */
 CREATE TABLE IF NOT EXISTS trade_bond (
   trade_id        TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
 
-  /* 債券タイプ */
+  -- 銘柄参照（NULL可：私募や未整備銘柄にも対応）
+  security_id     TEXT REFERENCES bond_def(security_id),
+
+  -- 債券タイプ（取引側で上書き可能）
   coupon_type     TEXT NOT NULL CHECK (coupon_type IN ('FIX','FLOAT','ZC')),
 
-  /* 固定債フィールド（coupon_type='FIX' で必須） */
-  coupon_rate     REAL,                                              -- 年率
+  -- 固定債フィールド（coupon_type='FIX' のとき意味を持つ；非NULLなら銘柄を上書き）
+  coupon_rate     REAL,
   coupon_daycount TEXT REFERENCES daycount(code),
-  coupon_freq     TEXT,                                              -- '1Y','6M','3M' 等
+  coupon_freq     TEXT,                                        -- '1Y','6M','3M' 等
   coupon_bdc      TEXT REFERENCES bizday_convention(code),
   coupon_cal_id   TEXT REFERENCES calendar_def(cal_id),
 
-  /* 変動債フィールド（coupon_type='FLOAT' で必須） */
+  -- 変動債フィールド（coupon_type='FLOAT' のとき意味を持つ）
   float_index_id  TEXT REFERENCES ref_rate_rule(index_id),
-  float_spread    REAL,                                              -- 年率
+  float_spread    REAL,
 
-  /* 共通（ZC含む） */
-  issuer          TEXT,
-  redemption      REAL NOT NULL DEFAULT 100.0,                       -- 額面＝100 を仮定
-  settlement_ccy  TEXT NOT NULL REFERENCES currency(ccy),
+  -- 共通
+  issuer          TEXT,                                        -- 取引表示用の上書き（任意）
+  redemption      REAL NOT NULL DEFAULT 100.0,                 -- 額面償還（%）
+  settlement_ccy  TEXT NOT NULL REFERENCES currency(ccy),      -- 決済通貨（通常は券面通貨と同一）
 
-  /* 整合チェック（SQLite の CHECK で条件付き必須を担保） */
+  -- 整合チェック（簡易）：タイプ別に主要必須の存在関係のみ担保
   CHECK (
-    (coupon_type='FIX'   AND coupon_rate IS NOT NULL
-                         AND coupon_daycount IS NOT NULL
-                         AND coupon_freq IS NOT NULL
-                         AND coupon_bdc IS NOT NULL
-                         AND coupon_cal_id IS NOT NULL
-                         AND float_index_id IS NULL
-                         AND float_spread IS NULL)
+    (coupon_type='FIX'   AND (coupon_rate IS NOT NULL OR security_id IS NOT NULL))
     OR
-    (coupon_type='FLOAT' AND float_index_id IS NOT NULL
-                         AND float_spread IS NOT NULL
-                         AND coupon_daycount IS NOT NULL
-                         AND coupon_freq IS NOT NULL
-                         AND coupon_bdc IS NOT NULL
-                         AND coupon_cal_id IS NOT NULL
-                         AND coupon_rate IS NULL)
+    (coupon_type='FLOAT' AND ((float_index_id IS NOT NULL AND float_spread IS NOT NULL) OR security_id IS NOT NULL))
     OR
-    (coupon_type='ZC'    AND coupon_rate IS NULL
-                         AND float_index_id IS NULL
-                         AND float_spread IS NULL
-                         /* ZC は daycount/freq 不要 */
-                         )
+    (coupon_type='ZC'    AND coupon_rate IS NULL AND float_index_id IS NULL AND float_spread IS NULL)
   )
 );
-
 
 /* ============ FX フォワード（据え置き） ============ */
 CREATE TABLE IF NOT EXISTS trade_fxfwd (
@@ -644,6 +718,37 @@ CREATE TABLE IF NOT EXISTS trade_swaption (
   )
 );
 CREATE INDEX IF NOT EXISTS idx_swaption_expiry ON trade_swaption(expiry_date);
+
+CREATE TABLE IF NOT EXISTS trade_ir_futures (
+  trade_id           TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  fut_code           TEXT NOT NULL REFERENCES ir_futures_def(fut_code),
+  contract_month     TEXT NOT NULL,                          -- 'YYYY-MM'（限月）
+  last_trading_date  TEXT,                                   -- 明示指定（NULLは規約から導出）
+  position_lots      INTEGER NOT NULL,                       -- 枚数（ロング>0/ショート<0）
+  price_agreed       REAL NOT NULL,                          -- 約定時の先物価格（PRICE or RATE；quote_conv参照）
+  margin_style       TEXT NOT NULL CHECK (margin_style IN ('EXCHANGE','BILATERAL')),
+  cal_id_override    TEXT REFERENCES calendar_def(cal_id),   -- 取引所カレンダー明示（通常NULL）
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
+
+CREATE TABLE IF NOT EXISTS trade_fra (
+  trade_id           TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
+  ccy                TEXT NOT NULL REFERENCES currency(ccy),
+  notional           REAL NOT NULL,
+  pay_rec            TEXT NOT NULL CHECK (pay_rec IN ('PAY','REC')), -- 固定支払/受取（FRAレートの方向）
+  fra_rate_agreed    REAL NOT NULL,                                  -- 約定FRAレート（固定）
+  ref_rate_id        TEXT NOT NULL REFERENCES ref_rate_rule(ref_rate_id), -- 観測指標（例: 'USD-SOFR-3M','JPY-TONAR-3M'）
+  accrual_start_date TEXT NOT NULL,                                   -- 開始日
+  accrual_end_date   TEXT NOT NULL,                                   -- 終了日
+  daycount           TEXT NOT NULL REFERENCES daycount(code),
+  pay_bdc            TEXT NOT NULL REFERENCES bizday_convention(code),
+  pay_cal_id         TEXT NOT NULL REFERENCES calendar_def(cal_id),
+  fixing_lag_bd      INTEGER NOT NULL DEFAULT 0,                      -- 観測ラグ（営業日）
+  fixing_bdc         TEXT NOT NULL REFERENCES bizday_convention(code),
+  fixing_cal_id      TEXT NOT NULL REFERENCES calendar_def(cal_id),
+  settlement_type    TEXT NOT NULL CHECK (settlement_type IN ('CASH')), -- v1はキャッシュ決済のみ
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 
 /* =========================
    評価実行
