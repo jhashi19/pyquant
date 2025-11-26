@@ -28,7 +28,7 @@
 - Cap/Floor
 - ヨーロピアンSwaption
 #### 測定値
-- PVのみ
+- PV, PL
 #### 通貨
 - JPY
 - USD

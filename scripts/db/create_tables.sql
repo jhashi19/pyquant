@@ -10,10 +10,10 @@ CREATE TABLE IF NOT EXISTS m_calendar_role (
 
 -- INSERT OR IGNORE INTO m_calendar_role (role, display_name, description, precedence)
 -- VALUES
---   ('DEFAULT',       'Default',        '通貨の一般業務用の既定カレンダー（非FXのスケジュール生成等）',            100),
+--   ('DEFAULT',       'Default',        '通貨の一般業務用のデフォルトカレンダー（非FXのスケジュール生成等）',            100),
 --   ('SETTLEMENT',    'Settlement',     '決済用途（FXのSpot/T+N、受渡日、行使・決済日の共通営業日ANDなど）',         100),
 --   ('HOLIDAY_ONLY',  'Holiday Only',   '休業日集合のみ参照（営業日ロールには使用しないUI/検証用）',                 200),
---   ('FIXING',        'Rate Fixing',    'Fixing/観測日用途の既定カレンダー（必要になったら利用）',                   150),
+--   ('FIXING',        'Rate Fixing',    'Fixing/観測日用途のデフォルトカレンダー（必要になったら利用）',                   150),
 --   ('EXCHANGE',      'Exchange',       '上場商品の取引所カレンダー（限月・最終売買日など）',                         150),
 --   ('CLEARING',      'Clearing',       '清算機関（CCP）業務日カレンダー（証拠金や清算関連）',                       150),
 --   ('DELIVERY',      'Physical Delivery','現物受渡拠点に紐づくカレンダー（コモディティ等で使用）',                  150);
@@ -56,7 +56,7 @@ CREATE TABLE IF NOT EXISTS currency_calendar (
   enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
   created_at TEXT NOT NULL,
   PRIMARY KEY (ccy, role),                  -- 1通貨×1役割 = 1行を基本とする
-  UNIQUE (ccy, role, cal_id)                -- 同一通貨・役割で同一カレンダーを重複登録しない
+  -- UNIQUE (ccy, role, cal_id)                -- 同一通貨・役割で同一カレンダーを重複登録しない ←PKを考慮すると不要な条件
 );
 
 CREATE TABLE daycount (
@@ -119,9 +119,9 @@ CREATE TABLE ref_rate_rule (
   lookback_days INTEGER NOT NULL DEFAULT 0,
   lockout_days INTEGER NOT NULL DEFAULT 0,
   source_tag TEXT,
-  enabled INTEGER NOT NULL DEFAULT 1,
-  valid_from TEXT NOT NULL,
-  retired_at TEXT,
+  enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
+  valid_from TEXT NOT NULL,             -- 'YYYY-MM-DD'
+  retired_at TEXT,                      -- 廃止日
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
@@ -252,6 +252,31 @@ CREATE INDEX IF NOT EXISTS ix_curve_point_curve_x
 
 CREATE INDEX IF NOT EXISTS ix_curve_point_snapshot_curve
   ON curve_point (snapshot_id, curve_id);
+
+CREATE TABLE IF NOT EXISTS ir_futures_def (
+  fut_code           TEXT PRIMARY KEY,                         -- 金利先物銘柄コード（例: 'CME_SOFR3M','TSE_JGB10Y'）
+  display_name       TEXT NOT NULL,                            -- 表示名（例: 'CME 3M SOFR Futures','JGB 10Y Futures'）
+  exchange_code      TEXT NOT NULL,                            -- 取引所コード（例: 'CME','SGX','TSE'）
+  ccy                TEXT NOT NULL REFERENCES currency(ccy),   -- 損益通貨（通常は原資産通貨）
+
+  -- 先物が示唆する基準金利（任意）。可能であれば ref_rate_rule.index_id を設定する
+  underlying_ref_rate_id TEXT REFERENCES ref_rate_rule(index_id),
+
+  contract_notional  REAL NOT NULL,                            -- 1枚あたり想定元本（名目元本、例: 1_000_000）
+  tick_size          REAL NOT NULL,                            -- 価格最小刻み幅（例: 0.0025）
+  tick_value         REAL NOT NULL,                            -- 価格1tickあたりの金額価値（例: 12.5）
+
+  -- 価格表現方法：'PRICE' = 100-価格型（例: 95.25 ⇒ 4.75%）, 'RATE' = レート直クォート
+  quote_conv         TEXT NOT NULL CHECK (quote_conv IN ('PRICE','RATE')),
+
+  -- 最終売買日算出のための規約（必要な銘柄のみ設定）
+  last_trading_bdc   TEXT REFERENCES bizday_convention(code),  -- 最終売買日営業日規則（例: 'MODFOL'）
+  last_trading_cal_id TEXT REFERENCES calendar_def(cal_id),    -- 最終売買日カレンダーID（取引所カレンダー等）
+
+  notes              TEXT,                                     -- 契約仕様に関する補足メモ（例外条件など）
+  enabled            INTEGER NOT NULL DEFAULT 1,               -- 有効フラグ（1=有効, 0=無効）
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+);
 
 CREATE TABLE IF NOT EXISTS market_ir_futures (
   snapshot_id        TEXT NOT NULL REFERENCES market_snapshot(snapshot_id) ON DELETE CASCADE,
