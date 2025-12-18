@@ -46,7 +46,7 @@ CREATE TABLE currency (
   enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
   valid_from TEXT NOT NULL,             -- 'YYYY-MM-DD'
   retired_at TEXT,                      -- 廃止日
-  created_at TEXT NOT NULL              -- 作成UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))   -- 作成UTC
 );
 
 CREATE TABLE IF NOT EXISTS currency_calendar (
@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS currency_calendar (
   role       TEXT NOT NULL REFERENCES m_calendar_role(role) ON UPDATE CASCADE ON DELETE RESTRICT,
   cal_id     TEXT NOT NULL REFERENCES calendar_def(cal_id),
   enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
-  created_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (ccy, role),                  -- 1通貨×1役割 = 1行を基本とする
   -- UNIQUE (ccy, role, cal_id)                -- 同一通貨・役割で同一カレンダーを重複登録しない ←PKを考慮すると不要な条件
 );
@@ -65,7 +65,7 @@ CREATE TABLE daycount (
   formula_tag TEXT NOT NULL UNIQUE,              -- 実装識別子: 'ACT_360','ACT_365F','ACT_ACT_ISDA','THIRTY_E_360' 等
   notes TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE TABLE bizday_convention (
@@ -75,7 +75,7 @@ CREATE TABLE bizday_convention (
   nearest_tiebreaker TEXT CHECK(nearest_tiebreaker IN ('PREV','NEXT')), -- NEAREST専用
   notes TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE TABLE calendar_def (
@@ -83,7 +83,7 @@ CREATE TABLE calendar_def (
   display_name TEXT NOT NULL,
   time_zone TEXT NOT NULL,                 -- e.g., 'Asia/Tokyo'
   enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
 CREATE TABLE market_holiday (
@@ -95,7 +95,7 @@ CREATE TABLE market_holiday (
   is_half_day INTEGER NOT NULL DEFAULT 0,
   notes TEXT,
   enabled INTEGER NOT NULL DEFAULT 1,
-  created_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (cal_id, holiday)
 );
 
@@ -136,7 +136,7 @@ CREATE TABLE market_snapshot (
   qa_status           TEXT NOT NULL DEFAULT 'PENDING' CHECK(qa_status IN ('PENDING','APPROVED','REJECTED')), -- 品質審査状態
   note                TEXT,                                     -- 補足
   locked_at           TEXT,                                     -- 当版をロックしたUTC時刻（EOD確定の時刻）
-  created_at          TEXT NOT NULL                              -- 生成UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))    -- 生成UTC
 );
 CREATE UNIQUE INDEX ux_market_snapshot_hash ON market_snapshot(data_hash);
 CREATE INDEX        ix_market_snapshot_asof ON market_snapshot(as_of, cut_label);
@@ -160,7 +160,7 @@ CREATE TABLE fx_spot (
   is_cross_derived INTEGER NOT NULL DEFAULT 0,               -- 1=クロス導出（例: EURJPY = EURUSD*USDJPY）
   derived_via_1    TEXT,                                     -- 由来ペア1（例: 'EURUSD'）
   derived_via_2    TEXT,                                     -- 由来ペア2（例: 'USDJPY'）
-  created_at       TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   /* クロス導出時のみ由来ペアを要求（運用上の一貫性チェック） */
   CHECK ( (is_cross_derived = 0) OR (derived_via_1 IS NOT NULL AND derived_via_2 IS NOT NULL) ),
 
@@ -238,7 +238,7 @@ CREATE TABLE curve_point (
   pillar_source   TEXT NOT NULL DEFAULT 'RAW'
                     CHECK (pillar_source IN ('RAW','BOOTSTRAP','DERIVED','SMOOTHED')),
   source_symbol   TEXT,                       -- ベンダの銘柄/コード等（任意）
-  created_at      TEXT NOT NULL,              -- 取込UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),   -- 取込UTC
 
   /* 主キー：同一スナップショット＋カーブで、ピラー一意（TENOR/DATE 併用を許容） */
   PRIMARY KEY (snapshot_id, curve_id, COALESCE(pillar_date, tenor))
@@ -283,7 +283,7 @@ CREATE TABLE IF NOT EXISTS market_ir_futures (
   bid                REAL,
   ask                REAL,
   source_symbol      TEXT,                                   -- ベンダ銘柄ID
-  created_at         TEXT NOT NULL,                          
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (snapshot_id, fut_code, contract_month)
 );
 
@@ -382,7 +382,7 @@ CREATE TABLE vol_fx (
   quote_time_utc TEXT,                                           -- 観測UTC（ペア固有）
   source_symbol  TEXT,                                           -- ベンダ銘柄/ティッカー
   surface_tag    TEXT,                                           -- 任意の面タグ（'TRADABLE','CALIB','VENDOR_A' 等）
-  created_at     TEXT NOT NULL,                                  -- 取込UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))  -- 取込UTC
 
   /* 整合チェック：smile_type に応じて必須列を切替 */
   CHECK (
@@ -444,7 +444,7 @@ CREATE TABLE vol_capfloor (
   quote_time_utc TEXT,                                            -- 観測UTC
   source_symbol  TEXT,                                            -- ベンダ識別
   surface_tag    TEXT,                                            -- 面の用途タグ
-  created_at     TEXT NOT NULL,                                   -- 取込UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))    -- 取込UTC
 
   CHECK (
     (smile_type='ATM'    AND strike_rate IS NULL)
@@ -485,7 +485,7 @@ CREATE TABLE vol_swaption (
   quote_time_utc TEXT,
   source_symbol  TEXT,
   surface_tag    TEXT,
-  created_at     TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 
   UNIQUE (snapshot_id, ccy,
           COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
@@ -501,7 +501,7 @@ CREATE TABLE historical_fixing (
   fixing_date    TEXT NOT NULL,          -- 観測日
   rate           REAL NOT NULL,          -- 確定レート
   source_symbol  TEXT,
-  created_at     TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (index_id, fixing_date)
 );
 
@@ -518,7 +518,7 @@ CREATE TABLE model_param (
   param_unit  TEXT,                                               -- 'abs','bp','ratio' 等（任意）
   source_symbol TEXT,                                             -- ベンダ/由来
   note        TEXT,
-  created_at  TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (snapshot_id, model_tag, scope, param_key, param_name)
 );
 
@@ -550,6 +550,7 @@ CREATE INDEX IF NOT EXISTS idx_portfolio_active
    ========================= */
 CREATE TABLE trade (
   trade_id       TEXT PRIMARY KEY,
+  logical_trade_id TEXT NOT NULL,         -- 同一ロジカル取引（同一Deal）の固定ID：全バージョンで共通
   product        TEXT NOT NULL REFERENCES m_trade_product(product),
   portfolio_id   TEXT REFERENCES portfolio(portfolio_id),
   ccy            TEXT NOT NULL REFERENCES currency(ccy),          -- 報告/換算通貨
@@ -560,10 +561,10 @@ CREATE TABLE trade (
   maturity_date   TEXT,
   status          TEXT CHECK (status IN (
                       'NEW','AMENDED','CANCELLED','EXERCISED','EXPIRED','NOVATED')),
-  version_no      INTEGER,
-  parent_trade_id TEXT REFERENCES trade(trade_id),
-  replaced_by_trade_id TEXT REFERENCES trade(trade_id),
-  is_active       INTEGER NOT NULL DEFAULT 1,
+  version_no      INTEGER,         -- バージョン番号（同一 logical_trade_id 内で単調増加）
+  parent_trade_id TEXT REFERENCES trade(trade_id),       -- 直前バージョン（チェーンの前方向）。ルートは NULL
+  replaced_by_trade_id TEXT REFERENCES trade(trade_id),  -- 直後バージョン（チェーンの後方向）。最新は NULL
+  is_current       INTEGER NOT NULL DEFAULT 1,            -- 評価対象か（キャンセル/行使/失効などは 0 を想定）
   external_id     TEXT,
   counterparty    TEXT,
   cleared_flag    INTEGER DEFAULT 0,
@@ -574,16 +575,100 @@ CREATE TABLE trade (
   trader          TEXT,
   sales           TEXT,
   strategy_tag    TEXT,
-  valid_from      TEXT NOT NULL,
+  valid_from      TEXT NOT NULL,    -- 'YYYY-MM-DD'（日次）で統一し、run.as_of と同粒度で比較する。有効期間の開始。
+  valid_to        TEXT,             -- 'YYYY-MM-DD'（日次）で統一し、run.as_of と同粒度で比較する。有効期間の終了。
   updated_at      TEXT,
   closed_at       TEXT,
   canceled_at     TEXT,
   source_tag      TEXT,
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  /* ルートは logical_trade_id=trade_id を必須化（ロジカルIDの起点を固定） */
+  CHECK (parent_trade_id IS NOT NULL OR logical_trade_id = trade_id),
+  CHECK (valid_to IS NULL OR valid_from < valid_to)
 );
 CREATE INDEX IF NOT EXISTS idx_trade_product ON trade(product);
 CREATE INDEX IF NOT EXISTS idx_trade_portfolio ON trade(portfolio_id);
 CREATE INDEX IF NOT EXISTS idx_trade_portfolio_active ON trade(portfolio_id, is_active);
+
+/* logical_trade_id × version_no の一意性（版の重複防止） */
+CREATE UNIQUE INDEX IF NOT EXISTS ux_trade_logical_version
+  ON trade (logical_trade_id, version_no);
+
+/* 1ロジカル取引につき「valid_to=NULL（＝最新）」は高々1行 */
+CREATE UNIQUE INDEX IF NOT EXISTS ux_trade_logical_open
+  ON trade (logical_trade_id)
+  WHERE valid_to IS NULL;
+
+/* チェーン追跡・履歴表示を高速化 */
+CREATE INDEX IF NOT EXISTS idx_trade_parent
+  ON trade (parent_trade_id);
+
+CREATE INDEX IF NOT EXISTS idx_trade_replaced_by
+  ON trade (replaced_by_trade_id);
+
+/* as-of 解決（run作成時の対象抽出）向け：
+   OR を避けるため、open/closed で部分インデックスを分ける（SQLite想定） */
+CREATE INDEX IF NOT EXISTS idx_trade_open_active_scope
+  ON trade (book_id, product, ccy, valid_from, trade_id)
+  WHERE is_active = 1 AND valid_to IS NULL;
+
+CREATE INDEX IF NOT EXISTS idx_trade_closed_active_scope
+  ON trade (book_id, product, ccy, valid_from, valid_to, trade_id)
+  WHERE is_active = 1 AND valid_to IS NOT NULL;
+
+/* 1) ポートフォリオ単位での一覧：取引日ソート（ORDER BY trade_date） */
+CREATE INDEX IF NOT EXISTS idx_trade_active_portfolio_trade_date
+  ON trade (portfolio_id, trade_date, trade_id)
+  WHERE is_active = 1;
+
+/* 2) ポートフォリオ単位での一覧：残存期間ソート（ORDER BY maturity_date） */
+CREATE INDEX IF NOT EXISTS idx_trade_active_portfolio_maturity_date
+  ON trade (portfolio_id, maturity_date, trade_id)
+  WHERE is_active = 1;
+
+/* 3) 条件検索（ポートフォリオ×商品×通貨×ステータス）を素直に絞る */
+CREATE INDEX IF NOT EXISTS idx_trade_active_portfolio_product_ccy_status
+  ON trade (portfolio_id, product, ccy, status, trade_id)
+  WHERE is_active = 1;
+
+/* 4) ポートフォリオを跨いで status だけで切るケース（例：CANCELLED の棚卸し） */
+CREATE INDEX IF NOT EXISTS idx_trade_active_status
+  ON trade (status, trade_id)
+  WHERE is_active = 1;
+
+/* parent_trade_id がある＝直前バージョンを指定して新バージョンを追加する前提 */
+CREATE TRIGGER IF NOT EXISTS trg_trade_version_link
+AFTER INSERT ON trade
+WHEN NEW.parent_trade_id IS NOT NULL
+BEGIN
+  /* 直前バージョンをクローズして後継リンクを張る */
+  UPDATE trade
+    SET replaced_by_trade_id = NEW.trade_id,
+         valid_to            = NEW.valid_from,
+         updated_at          = (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+   WHERE trade_id = NEW.parent_trade_id;
+
+  /* 親が存在しない/既に後継がいる等の異常を弾く */
+  SELECT RAISE(ABORT, 'invalid parent_trade_id or branching')
+   WHERE NOT EXISTS (SELECT 1 FROM trade p WHERE p.trade_id = NEW.parent_trade_id);
+
+  SELECT RAISE(ABORT, 'parent already has replaced_by_trade_id')
+   WHERE EXISTS (
+     SELECT 1 FROM trade p
+      WHERE p.trade_id = NEW.parent_trade_id
+        AND p.replaced_by_trade_id IS NOT NULL
+        AND p.replaced_by_trade_id <> NEW.trade_id
+   );
+
+  /* logical_trade_id は親と同一であること（チェーンの一貫性） */
+  SELECT RAISE(ABORT, 'logical_trade_id must match parent')
+   WHERE (SELECT logical_trade_id FROM trade WHERE trade_id = NEW.parent_trade_id) <> NEW.logical_trade_id;
+
+  /* version_no は親+1（親がNULL等のケースはアプリで明示的に制御） */
+  SELECT RAISE(ABORT, 'version_no must be parent.version_no + 1')
+   WHERE (SELECT version_no FROM trade WHERE trade_id = NEW.parent_trade_id) + 1 <> NEW.version_no;
+END;
 
 /* ============ 商品別：IRS ============ */
 CREATE TABLE IF NOT EXISTS trade_irs (
@@ -829,10 +914,9 @@ CREATE TABLE trade_schedule (
   start_date     TEXT,                   -- 利息計算期間開始
   end_date       TEXT,                   -- 利息計算期間終了
   payment_type   TEXT NOT NULL,          -- 'INTEREST', 'PRINCIPAL', 'FEE' 等
-  currency       TEXT NOT NULL REFERENCES currency(ccy),
+  ccy       TEXT NOT NULL REFERENCES currency(ccy),
   notional       REAL,                   -- 計算基準元本
-  rate           REAL,                   -- 適用金利（変動の場合はFixing済み、未定ならNULLまたは予測値）
-  forecast_amount REAL,                  -- 現在のマーケットでの予測支払額
+  rate           REAL,                   -- 適用金利（変動の場合はFixing済み、未定ならNULL）
   fixed_amount   REAL,                   -- 確定した支払額（Fixing後）
   is_settled     INTEGER NOT NULL DEFAULT 0,      -- 決済済みフラグ：0=未決済, 1=決済済み
   created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
@@ -846,6 +930,10 @@ CREATE INDEX IF NOT EXISTS idx_trade_schedule_trade_leg
 /* 評価日別キャッシュフロー集計など、日付横断の検索用 */
 CREATE INDEX IF NOT EXISTS idx_trade_schedule_payment_date
   ON trade_schedule(payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_trade_schedule_unsettled_date
+  ON trade_schedule(is_settled, payment_date);
+
 
 CREATE TABLE IF NOT EXISTS measure_def (
   measure_id           TEXT PRIMARY KEY,
@@ -926,6 +1014,7 @@ CREATE INDEX IF NOT EXISTS ix_run_preset
 CREATE TABLE IF NOT EXISTS run_portfolio (
   run_id  TEXT NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
   portfolio_id TEXT NOT NULL REFERENCES portfolio(portfolio_id),
+  created_at  TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (run_id, portfolio_id)
 );
 CREATE INDEX IF NOT EXISTS idx_run_portfolio_portfolio
@@ -935,6 +1024,7 @@ CREATE INDEX IF NOT EXISTS idx_run_portfolio_portfolio
 CREATE TABLE IF NOT EXISTS run_ccy (
   run_id TEXT NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
   ccy    TEXT NOT NULL REFERENCES currency(ccy),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (run_id, ccy)
 );
 CREATE INDEX IF NOT EXISTS idx_run_ccy_ccy
@@ -944,6 +1034,7 @@ CREATE INDEX IF NOT EXISTS idx_run_ccy_ccy
 CREATE TABLE IF NOT EXISTS run_measure (
   run_id     TEXT NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
   measure_id TEXT NOT NULL REFERENCES measure_def(measure_id),
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (run_id, measure_id)
 );
 CREATE INDEX IF NOT EXISTS idx_run_measure_measure
@@ -959,11 +1050,28 @@ CREATE TABLE IF NOT EXISTS run_param (
   val_real  REAL,
   unit      TEXT,              -- 例: 'bp','paths','ms' 等（任意）
   note      TEXT,
+  created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (run_id, param_key),
   CHECK (val_text IS NOT NULL OR val_int IS NOT NULL OR val_real IS NOT NULL)
 );
 CREATE INDEX IF NOT EXISTS idx_run_param_key
   ON run_param(param_key);
+
+/* run が参照した trade バージョンを固定（materialize）して保持 */
+CREATE TABLE IF NOT EXISTS run_trade (
+  run_id          TEXT NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
+  trade_id        TEXT NOT NULL REFERENCES trade(trade_id),
+  logical_trade_id TEXT NOT NULL,
+  version_no      INTEGER NOT NULL,
+  created_at          TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  PRIMARY KEY (run_id, trade_id),
+  /* 1run内では 1ロジカル取引につき1バージョンのみ */
+  UNIQUE (run_id, logical_trade_id)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_trade_trade
+  ON run_trade(trade_id);
+
 
 
 
@@ -976,7 +1084,7 @@ CREATE TABLE result_eod (
   run_id        TEXT NOT NULL REFERENCES run(run_id),
   trade_id      TEXT NOT NULL REFERENCES trade(trade_id),
 
-  measure       TEXT NOT NULL REFERENCES measure_def(measure_id),  -- 'PV','PL','ACCRUAL' 等（主に VALUATION/PL）
+  measure_id       TEXT NOT NULL REFERENCES measure_def(measure_id),  -- 'PV','PL','ACCRUAL' 等（主に VALUATION/PL）
   scenario_id   INTEGER NOT NULL DEFAULT 0,                        -- 0=ベースケース
   bucket        TEXT NOT NULL DEFAULT '',                         -- 追加粒度キー（未指定は空文字）
 
@@ -985,14 +1093,19 @@ CREATE TABLE result_eod (
 
   calc_time_ms  REAL,                                             -- 任意：性能計測用
 
-  PRIMARY KEY (run_id, trade_id, measure, scenario_id, bucket)
+  PRIMARY KEY (run_id, trade_id, measure_id, scenario_id, bucket)
 );
 
-CREATE INDEX IF NOT EXISTS ix_result_eod_measure
-  ON result_eod (measure);
+CREATE INDEX IF NOT EXISTS ix_result_eod_measure_id ON result_eod (measure_id);
 
-CREATE INDEX IF NOT EXISTS ix_result_eod_trade
-  ON result_eod (trade_id);
+-- UI典型: run_id で対象ジョブを固定 → measure(PV/PL等) → scenario/bucket(通常は0/'') で一覧/集計
+CREATE INDEX IF NOT EXISTS ix_result_eod_run_measure_scn_bucket_trade
+  ON result_eod (run_id, measure, scenario_id, bucket, trade_id);
+
+-- さらに EOD の“ほぼ常用”条件（scenario_id=0 かつ bucket=''）を高速化したい場合（任意）
+CREATE INDEX IF NOT EXISTS ix_result_eod_run_measure_base
+  ON result_eod (run_id, measure_id, trade_id)
+  WHERE scenario_id = 0 AND bucket = '';
 
 
 /* 感応度結果（DV01/Delta/Vega 等） */
@@ -1000,7 +1113,7 @@ CREATE TABLE result_sensitivity (
   run_id        TEXT NOT NULL REFERENCES run(run_id),
   trade_id      TEXT NOT NULL REFERENCES trade(trade_id),
 
-  measure       TEXT NOT NULL REFERENCES measure_def(measure_id),  -- category='SENSITIVITY' を主対象
+  measure_id       TEXT NOT NULL REFERENCES measure_def(measure_id),  -- category='SENSITIVITY' を主対象
   scenario_id   INTEGER NOT NULL DEFAULT 0,                        -- シナリオ型感応度に拡張する余地
   bucket        TEXT NOT NULL DEFAULT '',
 
@@ -1009,14 +1122,14 @@ CREATE TABLE result_sensitivity (
 
   calc_time_ms  REAL,
 
-  PRIMARY KEY (run_id, trade_id, measure, scenario_id, bucket)
+  PRIMARY KEY (run_id, trade_id, measure_id, scenario_id, bucket)
 );
 
-CREATE INDEX IF NOT EXISTS ix_result_sens_measure
-  ON result_sensitivity (measure);
+CREATE INDEX IF NOT EXISTS ix_result_sens_measure_id ON result_sensitivity (measure_id);
 
-CREATE INDEX IF NOT EXISTS ix_result_sens_trade
-  ON result_sensitivity (trade_id);
+-- UI典型: run_id → measure(DV01等) → bucket(リスクファクター/テナー) で一覧/集計
+CREATE INDEX IF NOT EXISTS ix_result_sens_run_measure_bucket_scn_trade
+  ON result_sensitivity (run_id, measure_id, bucket, scenario_id, trade_id);
 
 
 /* シミュレーション／ストレス結果 */
@@ -1024,7 +1137,7 @@ CREATE TABLE result_simulation (
   run_id        TEXT NOT NULL REFERENCES run(run_id),
   trade_id      TEXT NOT NULL REFERENCES trade(trade_id),
 
-  measure       TEXT NOT NULL REFERENCES measure_def(measure_id),  -- 'PV','PL' 等
+  measure_id       TEXT NOT NULL REFERENCES measure_def(measure_id),  -- 'PV','PL' 等
   scenario_id   INTEGER NOT NULL DEFAULT 0,                        -- scenario_set 内の番号（0=ベース）
   bucket        TEXT NOT NULL DEFAULT '',                         -- 将来の時系列・パス等の追加軸
 
@@ -1033,14 +1146,15 @@ CREATE TABLE result_simulation (
 
   calc_time_ms  REAL,
 
-  PRIMARY KEY (run_id, trade_id, measure, scenario_id, bucket)
+  PRIMARY KEY (run_id, trade_id, measure_id, scenario_id, bucket)
 );
 
-CREATE INDEX IF NOT EXISTS ix_result_sim_measure
-  ON result_simulation (measure);
+CREATE INDEX IF NOT EXISTS ix_result_sim_measure_id ON result_simulation (measure_id);
 
-CREATE INDEX IF NOT EXISTS ix_result_sim_trade
-  ON result_simulation (trade_id);
+-- UI典型(1): run_id → measure(PV/PL) → bucket(''想定) → scenario別に集計（ベース vs ストレス比較）
+-- UI典型(2): run_id → measure(PV/PL) → scenario_id を選択 → 取引別一覧
+CREATE INDEX IF NOT EXISTS ix_result_sim_run_measure_bucket_scn_trade
+  ON result_simulation (run_id, measure_id, bucket, scenario_id, trade_id);
 
 /* =========================
    プライシングプロファイル
@@ -1076,26 +1190,68 @@ CREATE TABLE IF NOT EXISTS pricing_profile_map (
 /* =========================
    シナリオ
    ========================= */
-CREATE TABLE scenario_set (
-  scenario_set_id TEXT PRIMARY KEY,
-  set_name        TEXT NOT NULL,
+CREATE TABLE IF NOT EXISTS scenario_set (
+  scenario_set_id TEXT PRIMARY KEY,                               -- 例: 'SCN_BASE','SCN_STRESS_2025Q4'
+  set_name        TEXT NOT NULL,                                  -- UI表示名
+  set_type        TEXT NOT NULL,                                  -- 例: 'STRESS','SENSITIVITY','BACKTEST','REGULATORY'
   description     TEXT,
-  created_at      TEXT NOT NULL
+  owner_user_id   TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,  -- NULL=グローバル
+  is_active       INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  created_by      TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,
+  updated_at      TEXT,
+  updated_by      TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,
+  note            TEXT
 );
 
-CREATE TABLE scenario_shock (
-  scenario_set_id TEXT NOT NULL REFERENCES scenario_set(scenario_set_id),
-  scenario_id     INTEGER NOT NULL,                               -- 0,1,2...
-  target          TEXT NOT NULL CHECK(target IN ('CURVE','FX','VOL','MODEL_PARAM')),
-  target_key      TEXT NOT NULL,                                  -- 'JPY-OIS','USDJPY','vol_swaption:JPY' 等
-  op_tag          TEXT NOT NULL CHECK(op_tag IN ('ADD_BP','MULT','SET')),
-  shock_val       REAL NOT NULL,
-  note            TEXT,                                           -- 任意メモ
-  created_at      TEXT NOT NULL,
-  PRIMARY KEY (scenario_set_id, scenario_id, target, target_key, op_tag)
+-- UIの典型: 有効なセットを種別/名称で一覧
+CREATE INDEX IF NOT EXISTS ix_scenario_set_active_type_name
+  ON scenario_set (is_active, set_type, set_name);
+
+CREATE INDEX IF NOT EXISTS ix_scenario_set_owner_active
+  ON scenario_set (owner_user_id, is_active);
+
+/* 個別シナリオ定義（UI表示・有効化単位） */
+CREATE TABLE IF NOT EXISTS scenario (
+  scenario_set_id TEXT    NOT NULL REFERENCES scenario_set(scenario_set_id) ON DELETE CASCADE,
+  scenario_id     INTEGER NOT NULL,                                   -- 0,1,2...
+  scenario_name   TEXT    NOT NULL,                                   -- UI表示名（例: 'BASE','IR +100bp'）
+  description     TEXT,
+  is_active       INTEGER NOT NULL DEFAULT 1 CHECK (is_active IN (0,1)),
+  sort_order      INTEGER NOT NULL DEFAULT 0,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  created_by      TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,
+  updated_at      TEXT,
+  updated_by      TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,
+  note            TEXT,
+  PRIMARY KEY (scenario_set_id, scenario_id),
+  UNIQUE (scenario_set_id, scenario_name)
 );
 
-CREATE UNIQUE INDEX ux_currency_iso_numeric ON currency(iso_numeric);
+-- UIの典型: セット配下のシナリオを有効/表示順で一覧
+CREATE INDEX IF NOT EXISTS ix_scenario_list
+  ON scenario (scenario_set_id, is_active, sort_order, scenario_id);
+
+
+/* ショック定義（“個別シナリオ”の子） */
+CREATE TABLE IF NOT EXISTS scenario_shock (
+  scenario_set_id TEXT    NOT NULL,
+  scenario_id     INTEGER NOT NULL,
+  target          TEXT    NOT NULL CHECK(target IN ('CURVE','FX','VOL','MODEL_PARAM')),
+  target_key      TEXT    NOT NULL,                                  -- 'JPY-OIS','USDJPY','vol_swaption:JPY' 等
+  op_tag          TEXT    NOT NULL CHECK(op_tag IN ('ADD_BP','MULT','SET')),
+  shock_val       REAL    NOT NULL,
+  note            TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  created_by      TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,
+  updated_at      TEXT,
+  updated_by      TEXT REFERENCES app_user(user_id) ON DELETE SET NULL,
+
+  PRIMARY KEY (scenario_set_id, scenario_id, target, target_key, op_tag),
+  FOREIGN KEY (scenario_set_id, scenario_id)
+    REFERENCES scenario (scenario_set_id, scenario_id)
+    ON DELETE CASCADE
+);
 
 /* =========================
    アプリケーションユーザ・権限管理
@@ -1127,7 +1283,7 @@ CREATE TABLE IF NOT EXISTS user_role (
   role_id    TEXT NOT NULL REFERENCES role(role_id)       ON DELETE CASCADE,
   granted_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   granted_by TEXT,
-  created_at TEXT NOT NULL,
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (user_id, role_id)
 );
 
@@ -1143,7 +1299,7 @@ CREATE TABLE IF NOT EXISTS eval_preset (
   scenario_set_id  TEXT REFERENCES scenario_set(scenario_set_id) ON DELETE SET NULL,
   portfolio_scope       TEXT NOT NULL CHECK (portfolio_scope IN ('ALL','PORTFOLIO_LIST','PORTFOLIO_PREFIX')),
   ccy_scope        TEXT NOT NULL CHECK (ccy_scope  IN ('ALL','CCY_LIST','CCY_BASE')),
-  is_active        INTEGER NOT NULL DEFAULT 1,                                -- 1=有効,0=無効
+  enabled        INTEGER NOT NULL DEFAULT 1,                                -- 1=有効,0=無効
   created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   created_by       TEXT,                                                      -- 作成者ID
   updated_at       TEXT,
@@ -1177,7 +1333,44 @@ CREATE INDEX IF NOT EXISTS idx_eval_preset_ccy_ccy
 
 -- 計算メジャー（常に 1 件以上存在する想定）
 CREATE TABLE IF NOT EXISTS eval_preset_measure (
-  preset_id    TEXT NOT NULL REFERENCES eval_preset(preset_id) ON DELETE CASCADE,
-  measure_code TEXT NOT NULL,      -- 'PV','PL','DELTA','GAMMA','VEGA',... を想定
-  PRIMARY KEY (preset_id, measure_code)
+  preset_id  TEXT NOT NULL REFERENCES eval_preset(preset_id) ON DELETE CASCADE,
+  measure_id TEXT NOT NULL REFERENCES measure_def(measure_id),
+  PRIMARY KEY (preset_id, measure_id)
 );
+
+CREATE INDEX IF NOT EXISTS idx_eval_preset_measure_measure_id
+  ON eval_preset_measure(measure_id);
+
+/* =========================
+   変更履歴（監査ログ）
+   - 設定・マスタ画面の「なぜこの設定になっているか」を残す
+   - append-only（更新・削除しない）
+   ========================= */
+CREATE TABLE IF NOT EXISTS change_log (
+  change_id     INTEGER PRIMARY KEY AUTOINCREMENT,
+  table_name    TEXT NOT NULL,  -- 例: 'book','scenario_set','eval_preset','market_snapshot' など
+  pk            TEXT NOT NULL,  -- 対象PK（単一PKなら値そのまま、複合PKは "k1=v1;k2=v2" 等で直列化）
+  action        TEXT NOT NULL,  -- 例: 'INSERT','UPDATE','DISABLE','ENABLE','LOCK','UNLOCK','APPROVE' 等（運用で統一）
+  entity_label  TEXT,           -- UI表示名のスナップショット（任意）
+  changed_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  changed_by    TEXT,           -- app_user.user_id または 'SYSTEM','BATCH' 等
+  comment       TEXT,           -- 変更理由（UIで入力する「メモ」）
+  request_id    TEXT,           -- 1操作の相関ID（任意：APIリクエストID等）
+  client_tag    TEXT            -- 'UI','CLI','BATCH' 等（任意）
+);
+
+-- 典型クエリ：特定マスタ1件の履歴を新しい順に取得（UIの「履歴」タブ想定）
+CREATE INDEX IF NOT EXISTS ix_change_log_table_pk_time
+  ON change_log (table_name, pk, changed_at);
+
+-- 典型クエリ：全体の最新変更（管理者の監査ビュー想定）
+CREATE INDEX IF NOT EXISTS ix_change_log_changed_at
+  ON change_log (changed_at);
+
+-- 典型クエリ：ユーザ別の変更追跡（監査・運用）
+CREATE INDEX IF NOT EXISTS ix_change_log_changed_by_time
+  ON change_log (changed_by, changed_at);
+
+-- 任意：1操作（request_id）で束ねて追えるようにする
+CREATE INDEX IF NOT EXISTS ix_change_log_request
+  ON change_log (request_id);
