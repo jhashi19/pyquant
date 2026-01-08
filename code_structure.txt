@@ -1,0 +1,29 @@
+### 詳細な実装の構成
+pyquant/
+├── backend/                # FastAPI アプリケーション
+│   ├── app/
+│   │   ├── api/            # APIエンドポイント定義（取引登録、評価実行など）
+│   │   ├── core/           # 設定（DB接続設定、共通定数など）
+│   │   ├── crud/           # DB操作（Create/Read/Update/Delete）の共通ロジック
+│   │   ├── db/             # SQLite 接続、マイグレーション、初期化スクリプト
+│   │   ├── models/         # DBスキーマ定義（SQLAlchemy/SQLModel）
+│   │   ├── pricing/        # ★数理エンジンの核（商品別プライサー、感応度計算）
+│   │   │   ├── engines/    # 商品別計算ロジック（Bond, IRS, Option等）
+│   │   │   ├── math/       # 共通数理関数（補間、日数計算、確率過程）
+│   │   │   └── accelerator/ # 将来の高速化用（Numba/CUDA ラッパー）
+│   │   ├── schemas/        # API通信用の型定義（Pydantic）
+│   │   └── services/       # 業務ロジック（マーケット版の確定、Fixing解決等）
+│   ├── tests/              # ユニットテスト（特に数理ロジックの検証用）
+│   ├── main.py             # アプリケーションのエントリポイント
+│   └── requirements.txt    # 依存ライブラリ
+├── frontend/               # React アプリケーション
+│   ├── src/
+│   │   ├── api/            # バックエンドAPIを呼び出す関数群
+│   │   ├── components/     # 再利用可能なUIパーツ（テーブル、ダイアログ等）
+│   │   ├── hooks/          # カスタムフック（状態管理、API通信）
+│   │   ├── pages/          # 各画面（取引管理、マーケット管理、評価実行等）
+│   │   └── utils/          # フォーマッタ（日付、金額の表示形式変換）
+│   └── package.json
+├── data/                   # SQLite データベースファイル保存先
+├── docs/                   # 設計ドキュメント
+└── scripts/                # データ取込バッチや初期化用スクリプト
