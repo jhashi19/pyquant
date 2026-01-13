@@ -55,7 +55,7 @@ CREATE TABLE IF NOT EXISTS currency_calendar (
   cal_id     TEXT NOT NULL REFERENCES calendar_def(cal_id),
   enabled INTEGER NOT NULL DEFAULT 1,   -- 1=有効, 0=無効
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  PRIMARY KEY (ccy, role),                  -- 1通貨×1役割 = 1行を基本とする。v1ではroleはDEFAULTのみ。
+  PRIMARY KEY (ccy, role)                  -- 1通貨×1役割 = 1行を基本とする。v1ではroleはDEFAULTのみ。
 );
 
 CREATE TABLE daycount (
@@ -218,6 +218,15 @@ CREATE UNIQUE INDEX ux_market_snapshot_hash ON market_snapshot(data_hash);
 CREATE INDEX        ix_market_snapshot_asof ON market_snapshot(as_of, cut_label);
 CREATE INDEX        ix_market_snapshot_parent ON market_snapshot(parent_snapshot_id);
 
+/* market_snapshot: UI needs "latest locked snapshot" selection */
+CREATE INDEX IF NOT EXISTS ix_market_snapshot_locked_cut_asof_desc
+  ON market_snapshot (cut_label, as_of DESC, locked_at DESC)
+  WHERE is_locked = 1;
+
+/* market_snapshot: UI needs QA workflow lists (PENDING/APPROVED/REJECTED) */
+CREATE INDEX IF NOT EXISTS ix_market_snapshot_qa_status_created
+  ON market_snapshot (qa_status, created_at DESC);
+
 -- ---------------------------------------------------------------------
 -- market_snapshot_input
 --
@@ -240,9 +249,6 @@ CREATE TABLE IF NOT EXISTS market_snapshot_input (
 
   PRIMARY KEY (snapshot_id, role)
 );
-
-CREATE INDEX IF NOT EXISTS ix_market_snapshot_input_snapshot_role
-  ON market_snapshot_input(snapshot_id, role);
 
 CREATE INDEX IF NOT EXISTS ix_market_snapshot_input_batch
   ON market_snapshot_input(batch_id);
@@ -282,9 +288,6 @@ CREATE TABLE pricing_curve_def (
 
   /* FORECAST のときのみ対象参照金利を要求（例：'JPY-TONAR','USD-SOFR'） */
   ref_rate_id   TEXT,                                              -- NULL可（OIS/BOND）  
-  CHECK ( (curve_type='FORECAST' AND ref_rate_id IS NOT NULL)
-       OR (curve_type!='FORECAST' AND ref_rate_id IS NULL) ),
-
   /* 曲線“座標”の年率化と複利慣行（ゼロ↔DF 変換に使用） */
   daycount      TEXT NOT NULL REFERENCES daycount(code),
   compounding   TEXT NOT NULL DEFAULT 'CONT'
@@ -362,11 +365,9 @@ CREATE TABLE curve_point (
   PRIMARY KEY (snapshot_id, curve_id, pillar_kind, pillar_key)
 );
 
-CREATE INDEX IF NOT EXISTS ix_curve_point_curve_x
-  ON curve_point (curve_id, x_years);
-
-CREATE INDEX IF NOT EXISTS ix_curve_point_snapshot_curve
-  ON curve_point (snapshot_id, curve_id);
+/* curve_point: UI needs to display curve points for a snapshot+curve ordered by x_years */
+CREATE INDEX IF NOT EXISTS ix_curve_point_snapshot_curve_x
+  ON curve_point (snapshot_id, curve_id, x_years);
 
 CREATE TABLE IF NOT EXISTS ir_futures_def (
   fut_code           TEXT PRIMARY KEY,                         -- 金利先物銘柄コード（例: 'CME_SOFR3M','TSE_JGB10Y'）
@@ -443,8 +444,6 @@ CREATE TABLE vol_fx (
   base_ccy       TEXT NOT NULL REFERENCES currency(ccy),         -- 分子通貨（例: USD）
   quote_ccy      TEXT NOT NULL REFERENCES currency(ccy),         -- 分母通貨（例: JPY）
   pair           TEXT NOT NULL,                                  -- 'USDJPY'
-  CHECK (pair = base_ccy || quote_ccy),
-
   /* 満期（テナー or 実日付）＋ボルタイム（年率時間） */
   expiry_tenor   TEXT,                                           -- 例: '1W','1M','1Y'
   expiry_date    TEXT,                                           -- 例: '2026-03-31'
@@ -473,7 +472,9 @@ CREATE TABLE vol_fx (
   quote_time_utc TEXT,                                           -- 観測UTC（ペア固有）
   source_symbol  TEXT,                                           -- ベンダ銘柄/ティッカー
   surface_tag    TEXT,                                           -- 任意の面タグ（'TRADABLE','CALIB','VENDOR_A' 等）
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))  -- 取込UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),  -- 取込UTC
+
+  CHECK (pair = base_ccy || quote_ccy),
 
   /* 整合チェック：smile_type に応じて必須列を切替 */
   CHECK (
@@ -505,8 +506,6 @@ ON vol_fx(
   COALESCE(strike,-1.0),
   quote_type
 );
-CREATE INDEX IF NOT EXISTS ix_vol_fx_pair_expiry
-  ON vol_fx (pair, COALESCE(expiry_date, ''), COALESCE(expiry_tenor, ''));
 
 CREATE TABLE vol_capfloor (
   vol_id         TEXT PRIMARY KEY,                                -- UUID 等
@@ -535,24 +534,23 @@ CREATE TABLE vol_capfloor (
   quote_time_utc TEXT,                                            -- 観測UTC
   source_symbol  TEXT,                                            -- ベンダ識別
   surface_tag    TEXT,                                            -- 面の用途タグ
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))    -- 取込UTC
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),    -- 取込UTC
 
   CHECK (
     (smile_type='ATM'    AND strike_rate IS NULL)
     OR
     (smile_type='STRIKE' AND strike_rate IS NOT NULL)
-  ),
-
-  /* 旧スキーマ互換：ccy×expiry×index_tenor×quote_type×smile で重複防止 */
-  UNIQUE (snapshot_id, ccy,
-          COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
-          index_tenor, smile_type,
-          COALESCE(strike_rate,-1.0), quote_type)
+  )
 );
 
-CREATE INDEX IF NOT EXISTS ix_vol_capfloor_key
-  ON vol_capfloor (ccy, index_tenor,
-                   COALESCE(expiry_date,''), COALESCE(expiry_tenor,''));
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vol_capfloor_uq
+ON vol_capfloor(
+  snapshot_id, ccy,
+  COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
+  index_tenor, smile_type,
+  COALESCE(strike_rate,-1.0), quote_type
+);
 
 
 CREATE TABLE vol_swaption (
@@ -576,15 +574,16 @@ CREATE TABLE vol_swaption (
   quote_time_utc TEXT,
   source_symbol  TEXT,
   surface_tag    TEXT,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-
-  UNIQUE (snapshot_id, ccy,
-          COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
-          swap_tenor, quote_type)
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
-CREATE INDEX IF NOT EXISTS ix_vol_swaption_key
-  ON vol_swaption (ccy, COALESCE(expiry_date,''), COALESCE(expiry_tenor,''), swap_tenor);
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_vol_swaption_uq
+ON vol_swaption(
+  snapshot_id, ccy,
+  COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
+  swap_tenor, quote_type
+);
 
 /* 過去のFixing情報 */
 CREATE TABLE historical_fixing (
@@ -595,6 +594,10 @@ CREATE TABLE historical_fixing (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (index_id, fixing_date)
 );
+
+/* historical_fixing: UI needs to list fixings by date across indices */
+CREATE INDEX IF NOT EXISTS ix_historical_fixing_date
+  ON historical_fixing (fixing_date, index_id);
 
 /********** 2.x) マーケットクォート（ブートストラップ入力） **********/
 
@@ -697,7 +700,7 @@ CREATE TABLE IF NOT EXISTS market_quote_ir_futures (
 );
 
 CREATE INDEX IF NOT EXISTS ix_market_quote_ir_fut_code_expiry
-  ON market_quote_ir_futures(fut_code, expiry_yyyymm);
+  ON market_quote_ir_futures(fut_code, contract_month);
 
 -- ---------------------------------------------------------------------
 -- market_quote_swap
@@ -723,8 +726,6 @@ CREATE TABLE IF NOT EXISTS market_quote_swap (
   fixed_rate_mid  REAL NOT NULL,                                 -- パーレート（0.01=1%）
   fixed_rate_bid  REAL,
   fixed_rate_ask  REAL,
-  CHECK ( (fixed_rate_bid IS NULL AND fixed_rate_ask IS NULL) OR (fixed_rate_bid <= fixed_rate_ask) ),
-
   -- 固定脚規約
   fixed_freq      TEXT NOT NULL,                                 -- 例: '1Y','6M'
   fixed_daycount  TEXT NOT NULL REFERENCES daycount(code),
@@ -738,7 +739,9 @@ CREATE TABLE IF NOT EXISTS market_quote_swap (
   float_cal_id    TEXT REFERENCES calendar_def(cal_id),
 
   spot_lag_days   INTEGER NOT NULL DEFAULT 2,                    -- 開始日スポットラグ（日数）
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK ( (fixed_rate_bid IS NULL AND fixed_rate_ask IS NULL) OR (fixed_rate_bid <= fixed_rate_ask) )
 );
 
 CREATE INDEX IF NOT EXISTS ix_market_quote_swap_ccy_maturity
@@ -792,12 +795,6 @@ CREATE TABLE IF NOT EXISTS market_quote_bond (
 CREATE INDEX IF NOT EXISTS idx_market_quote_bond_security
   ON market_quote_bond (security_id);
 
-CREATE INDEX IF NOT EXISTS idx_market_quote_bond_snapshot
-  ON market_quote_bond (snapshot_id);
-
-
-
-
 /********** カーブ構築監査（ブートストラップ実行・フィット） **********/
 
 -- ---------------------------------------------------------------------
@@ -829,12 +826,6 @@ CREATE TABLE IF NOT EXISTS curve_build_run (
 
   UNIQUE (snapshot_id, curve_id)
 );
-
-CREATE INDEX IF NOT EXISTS ix_curve_build_run_snapshot
-  ON curve_build_run(snapshot_id);
-
-CREATE INDEX IF NOT EXISTS ix_curve_build_run_curve
-  ON curve_build_run(curve_id);
 
 
 
@@ -920,11 +911,9 @@ CREATE TABLE trade (
   CHECK (parent_trade_id IS NOT NULL OR logical_trade_id = trade_id),
   CHECK (valid_to IS NULL OR valid_from < valid_to)
 );
-CREATE INDEX IF NOT EXISTS idx_trade_product ON trade(product);
-CREATE INDEX IF NOT EXISTS idx_trade_portfolio ON trade(portfolio_id);
-CREATE INDEX IF NOT EXISTS idx_trade_portfolio_active ON trade(portfolio_id, is_active);
 
-/* logical_trade_id × version_no の一意性（版の重複防止） */
+
+/* trade: version/history */
 CREATE UNIQUE INDEX IF NOT EXISTS ux_trade_logical_version
   ON trade (logical_trade_id, version_no);
 
@@ -940,37 +929,22 @@ CREATE INDEX IF NOT EXISTS idx_trade_parent
 CREATE INDEX IF NOT EXISTS idx_trade_replaced_by
   ON trade (replaced_by_trade_id);
 
-/* as-of 解決（run作成時の対象抽出）向け：
-   OR を避けるため、open/closed で部分インデックスを分ける（SQLite想定） */
-CREATE INDEX IF NOT EXISTS idx_trade_open_active_scope
-  ON trade (book_id, product, ccy, valid_from, trade_id)
-  WHERE is_active = 1 AND valid_to IS NULL;
-
-CREATE INDEX IF NOT EXISTS idx_trade_closed_active_scope
-  ON trade (book_id, product, ccy, valid_from, valid_to, trade_id)
-  WHERE is_active = 1 AND valid_to IS NOT NULL;
-
-/* 1) ポートフォリオ単位での一覧：取引日ソート（ORDER BY trade_date） */
-CREATE INDEX IF NOT EXISTS idx_trade_active_portfolio_trade_date
+/* 取引一覧（原則：最新バージョンのみ） */
+CREATE INDEX IF NOT EXISTS idx_trade_latest_portfolio_trade_date
   ON trade (portfolio_id, trade_date, trade_id)
-  WHERE is_active = 1;
+  WHERE valid_to IS NULL;
 
-/* 2) ポートフォリオ単位での一覧：残存期間ソート（ORDER BY maturity_date） */
-CREATE INDEX IF NOT EXISTS idx_trade_active_portfolio_maturity_date
+CREATE INDEX IF NOT EXISTS idx_trade_latest_portfolio_maturity_date
   ON trade (portfolio_id, maturity_date, trade_id)
-  WHERE is_active = 1;
+  WHERE valid_to IS NULL;
 
-/* 3) 条件検索（ポートフォリオ×商品×通貨×ステータス）を素直に絞る */
-CREATE INDEX IF NOT EXISTS idx_trade_active_portfolio_product_ccy_status
+/* フィルタ（ポートフォリオ×商品×通貨×ステータス） */
+CREATE INDEX IF NOT EXISTS idx_trade_latest_portfolio_product_ccy_status
   ON trade (portfolio_id, product, ccy, status, trade_id)
-  WHERE is_active = 1;
+  WHERE valid_to IS NULL;
 
-/* 4) ポートフォリオを跨いで status だけで切るケース（例：CANCELLED の棚卸し） */
-CREATE INDEX IF NOT EXISTS idx_trade_active_status
-  ON trade (status, trade_id)
-  WHERE is_active = 1;
 
-/* parent_trade_id がある＝直前バージョンを指定して新バージョンを追加する前提 */
+
 CREATE TRIGGER IF NOT EXISTS trg_trade_version_link
 AFTER INSERT ON trade
 WHEN NEW.parent_trade_id IS NOT NULL
@@ -1035,9 +1009,6 @@ CREATE TABLE IF NOT EXISTS trade_irs_amortizing_schedule (
   PRIMARY KEY (trade_id, step_no),
   UNIQUE (trade_id, change_date)    -- 1 つの IRS で同じ change_date を重複登録しない
 );
-
-CREATE INDEX IF NOT EXISTS idx_irs_amortizing_trade_date
-  ON trade_irs_amortizing_schedule(trade_id, change_date);
 
 
 CREATE TABLE IF NOT EXISTS trade_bond (
@@ -1227,7 +1198,7 @@ CREATE TABLE IF NOT EXISTS trade_fra (
   notional           REAL NOT NULL,
   pay_rec            TEXT NOT NULL CHECK (pay_rec IN ('PAY','REC')), -- 固定支払/受取（FRAレートの方向）
   fra_rate_agreed    REAL NOT NULL,                                  -- 約定FRAレート（固定）
-  ref_rate_id        TEXT NOT NULL REFERENCES ref_rate_rule(ref_rate_id), -- 観測指標（例: 'USD-SOFR-3M','JPY-TONAR-3M'）
+  ref_rate_id        TEXT NOT NULL REFERENCES ref_rate_rule(index_id), -- 観測指標（例: 'USD-SOFR-3M','JPY-TONAR-3M'）
   accrual_start_date TEXT NOT NULL,                                   -- 開始日
   accrual_end_date   TEXT NOT NULL,                                   -- 終了日
   daycount           TEXT NOT NULL REFERENCES daycount(code),
@@ -1257,8 +1228,6 @@ CREATE TABLE trade_schedule (
 );
 
 /* 取引×レッグ単位での検索用 */
-CREATE INDEX IF NOT EXISTS idx_trade_schedule_trade_leg
-  ON trade_schedule(trade_id, leg_id);
 
 /* 評価日別キャッシュフロー集計など、日付横断の検索用 */
 CREATE INDEX IF NOT EXISTS idx_trade_schedule_payment_date
@@ -1375,8 +1344,6 @@ CREATE TABLE IF NOT EXISTS run_measure (
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   PRIMARY KEY (run_id, measure_id)
 );
-CREATE INDEX IF NOT EXISTS idx_run_measure_measure
-  ON run_measure(measure_id);
 
 
 /* =========================
@@ -1411,9 +1378,6 @@ CREATE TABLE result_eod (
 
   PRIMARY KEY (run_id, trade_id, pl_type)
 );
-
-CREATE INDEX IF NOT EXISTS ix_result_eod_run_trade
-  ON result_eod (run_id, trade_id);
 
 CREATE INDEX IF NOT EXISTS ix_result_eod_run_pltype
   ON result_eod (run_id, pl_type);
@@ -1478,8 +1442,6 @@ CREATE INDEX IF NOT EXISTS ix_result_sens_run_measure_bucket_trade
   ON result_sensitivity (run_id, measure_id, bucket, trade_id);
 
 -- ドリルダウン: run×trade の感応度一覧
-CREATE INDEX IF NOT EXISTS ix_result_sens_run_trade
-  ON result_sensitivity (run_id, trade_id);
 
 -- RF別に集計したい場合
 CREATE INDEX IF NOT EXISTS ix_result_sens_run_rf
@@ -1502,13 +1464,10 @@ CREATE TABLE result_simulation (
   PRIMARY KEY (run_id, trade_id, measure_id, scenario_set_id)
 );
 
-CREATE INDEX IF NOT EXISTS ix_result_sim_measure_id ON result_simulation (measure_id);
-
 -- UI典型(1): run_id → measure(PV/PL) → bucket(''想定) → scenario別に集計（ベース vs ストレス比較）
 -- UI典型(2): run_id → measure(PV/PL) → scenario_set_id を選択 → 取引別一覧
-CREATE INDEX IF NOT EXISTS ix_result_sim_run_measure_bucket_scn_trade
-  ON result_simulation (run_id, measure_id, bucket, scenario_set_id, trade_id);
-
+CREATE INDEX IF NOT EXISTS ix_result_sim_run_measure_scn_trade
+  ON result_simulation (run_id, measure_id, scenario_set_id, trade_id);
 /* =========================
    プライシングプロファイル
    ========================= */
