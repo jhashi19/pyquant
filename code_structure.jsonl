@@ -1,0 +1,30 @@
+{"path":"pyquant","type":"dir","description":"Quant / Risk Management application (Backend: FastAPI, Frontend: React)"}
+{"path":"pyquant/backend","type":"dir","description":"FastAPI application"}
+{"path":"pyquant/backend/app","type":"dir","description":"Backend application package"}
+{"path":"pyquant/backend/app/api","type":"dir","description":"API endpoints (trade registration, pricing execution, etc.)"}
+{"path":"pyquant/backend/app/core","type":"dir","description":"Settings and shared constants (DB config, common consts, etc.)"}
+{"path":"pyquant/backend/app/db","type":"dir","description":"SQLAlchemy models, DB session management, migrations"}
+{"path":"pyquant/backend/app/repository","type":"dir","description":"Data access layer (CRUD)"}
+{"path":"pyquant/backend/app/engine","type":"dir","description":"Quant core (math / financial engineering logic)"}
+{"path":"pyquant/backend/app/engine/math","type":"dir","description":"Interpolation, compounding, statistics, numerical methods (NumPy/SciPy)"}
+{"path":"pyquant/backend/app/engine/models","type":"dir","description":"Pricing models (Black, Garman-Kohlhagen, etc.)"}
+{"path":"pyquant/backend/app/engine/products","type":"dir","description":"Product-specific logic (IRS, Bond, FX, etc.)"}
+{"path":"pyquant/backend/app/engine/market","type":"dir","description":"Curve bootstrapping, volatility surface construction"}
+{"path":"pyquant/backend/app/engine/kernels","type":"dir","description":"Acceleration layer (Numba/CuPy implementations separated)"}
+{"path":"pyquant/backend/app/schemas","type":"dir","description":"Pydantic schemas for API I/O types"}
+{"path":"pyquant/backend/app/services","type":"dir","description":"Business logic (market snapshot fixing, resolving fixings, etc.)"}
+{"path":"pyquant/backend/tests","type":"dir","description":"Unit tests (especially for quant logic validation)"}
+{"path":"pyquant/backend/main.py","type":"file","description":"Application entrypoint"}
+{"path":"pyquant/backend/requirements.txt","type":"file","description":"Python dependencies"}
+{"path":"pyquant/frontend","type":"dir","description":"React application"}
+{"path":"pyquant/frontend/src","type":"dir","description":"Frontend sources"}
+{"path":"pyquant/frontend/src/api","type":"dir","description":"Functions to call backend APIs"}
+{"path":"pyquant/frontend/src/components","type":"dir","description":"Reusable UI components (tables, dialogs, etc.)"}
+{"path":"pyquant/frontend/src/hooks","type":"dir","description":"Custom hooks (state management, API calls)"}
+{"path":"pyquant/frontend/src/pages","type":"dir","description":"Screens (trade management, market management, pricing runs, etc.)"}
+{"path":"pyquant/frontend/src/types","type":"dir","description":"TypeScript type definitions"}
+{"path":"pyquant/frontend/src/utils","type":"dir","description":"Formatters (date / amount formatting etc.)"}
+{"path":"pyquant/frontend/package.json","type":"file","description":"Frontend dependencies and scripts"}
+{"path":"pyquant/data","type":"dir","description":"SQLite DB file storage"}
+{"path":"pyquant/docs","type":"dir","description":"Design documents"}
+{"path":"pyquant/scripts","type":"dir","description":"Data import batches and initialization scripts"}

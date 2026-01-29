@@ -290,8 +290,9 @@ CREATE TABLE pricing_curve_def (
   ref_rate_id   TEXT,                                              -- NULL可（OIS/BOND）  
   /* 曲線“座標”の年率化と複利慣行（ゼロ↔DF 変換に使用） */
   daycount      TEXT NOT NULL REFERENCES daycount(code),
-  compounding   TEXT NOT NULL DEFAULT 'CONT'
-                CHECK (compounding IN ('CONT','SIMPLE','ANNUAL')),
+  compounding   TEXT NOT NULL DEFAULT 'CONTINUOUS'
+                CHECK (compounding IN ('CONTINUOUS','SIMPLE','DISCRETE')),
+  compounding_freq INTEGER,                                       -- compounding='DISCRETE' のとき必須（例: 1=annual,2=semi annual,4=quarterly,12=monthly,365=daily）
 
   /* 評価規約：補間/外挿/ピラーの定義方法（実装を安定化） */
   interp_method TEXT NOT NULL REFERENCES m_interp_method(interp_method),
