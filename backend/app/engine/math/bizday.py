@@ -86,15 +86,15 @@ def adjust_business_day(
         return d
 
     match tag:
-        case BusinessDayRule.FOLLOWING:
-            return _next_business_day(d, calendar)
-        case BusinessDayRule.PRECEDING:
-            return _prev_business_day(d, calendar)
         case BusinessDayRule.MOD_FOLLOWING:
             next_bd = _next_business_day(d, calendar)
             if next_bd.month != d.month:
                 return _prev_business_day(d, calendar)
             return next_bd
+        case BusinessDayRule.FOLLOWING:
+            return _next_business_day(d, calendar)
+        case BusinessDayRule.PRECEDING:
+            return _prev_business_day(d, calendar)
         case BusinessDayRule.MOD_PRECEDING:
             prev_bd = _prev_business_day(d, calendar)
             if prev_bd.month != d.month:
@@ -122,14 +122,14 @@ def _normalize_rule(rule: BusinessDayRule | str) -> BusinessDayRule:
         return rule
     key = str(rule).strip().upper()
     match key:
+        case "MOD_FOLLOWING" | "MF":
+            return BusinessDayRule.MOD_FOLLOWING
         case "NONE":
             return BusinessDayRule.NONE
         case "FOLLOWING" | "F":
             return BusinessDayRule.FOLLOWING
         case "PRECEDING" | "P":
             return BusinessDayRule.PRECEDING
-        case "MOD_FOLLOWING" | "MF":
-            return BusinessDayRule.MOD_FOLLOWING
         case "MOD_PRECEDING" | "MP":
             return BusinessDayRule.MOD_PRECEDING
         case "NEAREST" | "N":

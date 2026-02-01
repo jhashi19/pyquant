@@ -31,8 +31,15 @@ def _sort_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
 def _flat_forward_extrapolate(
     x_nodes: np.ndarray, df_nodes: np.ndarray, xq: np.ndarray, *, side: str
 ) -> np.ndarray:
-    if x_nodes.size < 2:
-        raise ValueError("At least two nodes are required for flat-forward extrapolation.")
+    if x_nodes.size < 1:
+        raise ValueError("At least one node is required for extrapolation.")
+    
+    if x_nodes.size == 1:
+        # Single node: assume constant zero rate (flat curve)
+        t0 = x_nodes[0]
+        r = -np.log(df_nodes[0]) / t0 if t0 > 0 else 0.0
+        return np.exp(-r * xq)
+
     if side == "left":
         x0, x1 = x_nodes[0], x_nodes[1]
         df0, df1 = df_nodes[0], df_nodes[1]
@@ -48,8 +55,12 @@ def _flat_forward_extrapolate(
 def _linear_zero_extrapolate(
     x_nodes: np.ndarray, zero_nodes: np.ndarray, xq: np.ndarray, *, side: str
 ) -> np.ndarray:
-    if x_nodes.size < 2:
-        raise ValueError("At least two nodes are required for linear extrapolation.")
+    if x_nodes.size < 1:
+        raise ValueError("At least one node is required for extrapolation.")
+    
+    if x_nodes.size == 1:
+        return np.full_like(xq, zero_nodes[0])
+
     if side == "left":
         x0, x1 = x_nodes[0], x_nodes[1]
         z0, z1 = zero_nodes[0], zero_nodes[1]
@@ -360,10 +371,11 @@ class _MonotoneConvexSpline:
 
 
 @dataclass(frozen=True)
-class Curve:
+class CurveInterpolator:
     x: np.ndarray
     df_nodes: np.ndarray
     zero_nodes: np.ndarray
+    input_kind: str  # "DF" or "ZERO"
     compounding: str
     interp_method: str
     extrap_left: str
@@ -378,10 +390,10 @@ class Curve:
         df_nodes: Optional[Iterable[float]] = None,
         zero_nodes: Optional[Iterable[float]] = None,
         compounding: str = "CONTINUOUS",
-        interp_method: str = "LOG_LINEAR_DF",
+        interp_method: str = "LOG_LINEAR",
         extrap_left: str = "FLAT_FWD",
         extrap_right: str = "FLAT_FWD",
-    ) -> "Curve":
+    ) -> "CurveInterpolator":
         if (df_nodes is None) == (zero_nodes is None):
             raise ValueError("Provide exactly one of df_nodes or zero_nodes.")
 
@@ -397,30 +409,38 @@ class Curve:
             zero_arr = np.array(
                 [zero_rate_from_df(df, t, compounding) for df, t in zip(df_arr, x_arr)]
             )
+            input_kind = "DF"
         else:
             zero_arr = _to_numpy_1d(zero_nodes, "zero_nodes")
             x_arr, zero_arr = _sort_xy(x_arr, zero_arr)
             df_arr = np.array(
                 [discount_factor(r, t, compounding) for r, t in zip(zero_arr, x_arr)]
             )
+            input_kind = "ZERO"
 
         method = interp_method.upper()
         spline = None
-        if method == "CUBIC_SPLINE_ZERO":
+        if method == "CUBIC_SPLINE":
             spline = CubicSpline(x_arr, zero_arr, extrapolate=False)
-        elif method == "MONOTONE_CONVEX_SPLINE_ZERO":
+        elif method == "MONOTONE_CONVEX_SPLINE":
             spline = _MonotoneConvexSpline.from_discount_factors(x_arr, df_arr)
 
         return cls(
             x=x_arr,
             df_nodes=df_arr,
             zero_nodes=zero_arr,
+            input_kind=input_kind,
             compounding=compounding,
             interp_method=method,
             extrap_left=extrap_left.upper(),
             extrap_right=extrap_right.upper(),
             _spline=spline,
         )
+
+    def value(self, xq: ArrayLike) -> np.ndarray:
+        if self.input_kind == "DF":
+            return self.df(xq)
+        return self.zero_rate(xq)
 
     def df(self, xq: ArrayLike) -> np.ndarray:
         xq_arr = np.asarray(xq, dtype=float)
@@ -459,11 +479,11 @@ class Curve:
 
     def _interp_df(self, xq: np.ndarray) -> np.ndarray:
         method = self.interp_method
-        if method == "LOG_LINEAR_DF":
+        if method == "LOG_LINEAR":
             log_df = np.log(self.df_nodes)
             log_vals = np.interp(xq, self.x, log_df)
             return np.exp(log_vals)
-        if method == "MONOTONE_CONVEX_SPLINE_ZERO":
+        if method == "MONOTONE_CONVEX_SPLINE":
             if self._spline is None:
                 raise ValueError("Spline interpolator is not initialized.")
             return self._spline.df(xq)
@@ -475,9 +495,9 @@ class Curve:
 
     def _interp_zero(self, xq: np.ndarray) -> np.ndarray:
         method = self.interp_method
-        if method == "LINEAR_ZERO":
+        if method == "LINEAR":
             return np.interp(xq, self.x, self.zero_nodes)
-        if method == "CUBIC_SPLINE_ZERO":
+        if method == "CUBIC_SPLINE":
             if self._spline is None:
                 raise ValueError("Spline interpolator is not initialized.")
             return self._spline(xq)
@@ -491,7 +511,7 @@ class Curve:
             idx = 0 if side == "left" else -1
             z = self.zero_nodes[idx]
             return discount_factor(z, xq, self.compounding)
-        if method == "LINEAR_ZERO":
+        if method == "LINEAR":
             zeros = _linear_zero_extrapolate(self.x, self.zero_nodes, xq, side=side)
             return discount_factor(zeros, xq, self.compounding)
         raise ValueError(f"Unsupported extrapolation method: {method!r}")

@@ -20,7 +20,7 @@ CREATE TABLE IF NOT EXISTS m_calendar_role (
 
 
 CREATE TABLE m_interp_method (
-  interp_method TEXT PRIMARY KEY,  -- 'LOG_LINEAR_DF','LINEAR_ZERO','PIECEWISE_CONST_FWD','CUBIC_SPLINE_ZERO'
+  interp_method TEXT PRIMARY KEY,  -- 'LOG_LINEAR','LINEAR','CUBIC_SPLINE','MONOTONE_CONVEX_SPLINE'
   description  TEXT,              -- 用途の説明
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
