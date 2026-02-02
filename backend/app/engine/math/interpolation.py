@@ -1,88 +1,119 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from enum import Enum
 from typing import Iterable, Optional, Union
 
 import numpy as np
-from scipy.interpolate import CubicSpline
 
 from .rate_conversion import discount_factor, zero_rate_from_df
 
 
+
 ArrayLike = Union[float, Iterable[float], np.ndarray]
 
+EPS = 1e-16
+ETA_EPS = 1e-10
+DF_INC_EPS = 1e-14
+DF_AT_ZERO_EPS = 1e-10
 
-def _to_numpy_1d(values: Iterable[float], name: str) -> np.ndarray:
+
+class InterpMethod(Enum):
+    LOG_LINEAR = "LOG_LINEAR"
+    LINEAR = "LINEAR"
+    CUBIC_SPLINE = "CUBIC_SPLINE"
+    MONOTONE_CONVEX = "MONOTONE_CONVEX"
+
+
+class ExtrapMethod(Enum):
+    FLAT_FWD = "FLAT_FWD"
+    FLAT_ZERO = "FLAT_ZERO"
+    LINEAR = "LINEAR"
+
+
+def normalize_interp_method(method: InterpMethod | str) -> InterpMethod:
+    if isinstance(method, InterpMethod):
+        return method
+    key = str(method).strip().upper()
+    match key:
+        case "LOG_LINEAR" | "LOG_LINEAR_DF":
+            return InterpMethod.LOG_LINEAR
+        case "LINEAR" | "LINEAR_ZERO":
+            return InterpMethod.LINEAR
+        case "CUBIC_SPLINE" | "CUBIC_SPLINE_ZERO":
+            return InterpMethod.CUBIC_SPLINE
+        case "MONOTONE_CONVEX" | "MONOTONE_CONVEX_SPLINE" | "MONOTONE_CONVEX_SPLINE_ZERO":
+            return InterpMethod.MONOTONE_CONVEX
+        case _:
+            raise ValueError(f"Unsupported interpolation method: {method!r}")
+
+
+def normalize_extrap_method(method: ExtrapMethod | str) -> ExtrapMethod:
+    if isinstance(method, ExtrapMethod):
+        return method
+    key = str(method).strip().upper()
+    match key:
+        case "FLAT_FWD":
+            return ExtrapMethod.FLAT_FWD
+        case "FLAT_ZERO":
+            return ExtrapMethod.FLAT_ZERO
+        case "LINEAR" | "LINEAR_ZERO":
+            return ExtrapMethod.LINEAR
+        case _:
+            raise ValueError(f"Unsupported extrapolation method: {method!r}")
+
+
+def _ensure_exactly_one(df_nodes: Optional[Iterable[float]], zero_nodes: Optional[Iterable[float]]) -> None:
+    if (df_nodes is None) == (zero_nodes is None):
+        raise ValueError("Provide exactly one of df_nodes or zero_nodes.")
+
+
+def _as_1d_array(values: Iterable[float], name: str) -> np.ndarray:
     arr = np.asarray(values, dtype=float)
     if arr.ndim != 1:
         raise ValueError(f"{name} must be 1D.")
     return arr
 
 
-def _sort_xy(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+def _validate_non_negative_x(x: np.ndarray) -> None:
+    if np.any(x < 0.0):
+        raise ValueError("x must be non-negative.")
+
+
+def _sort_by_x(x: np.ndarray, y: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
     order = np.argsort(x)
-    x_sorted = x[order]
-    y_sorted = y[order]
-    if np.any(np.diff(x_sorted) <= 0.0):
-        raise ValueError("x must be strictly increasing.")
-    return x_sorted, y_sorted
+    return x[order], y[order]
 
 
-def _flat_forward_extrapolate(
-    x_nodes: np.ndarray, df_nodes: np.ndarray, xq: np.ndarray, *, side: str
-) -> np.ndarray:
-    if x_nodes.size < 1:
-        raise ValueError("At least one node is required for extrapolation.")
-    
-    if x_nodes.size == 1:
-        # Single node: assume constant zero rate (flat curve)
-        t0 = x_nodes[0]
-        r = -np.log(df_nodes[0]) / t0 if t0 > 0 else 0.0
-        return np.exp(-r * xq)
+def validate_curve_inputs(
+    x: Iterable[float],
+    *,
+    df_nodes: Optional[Iterable[float]] = None,
+    zero_nodes: Optional[Iterable[float]] = None,
+    compounding: str = "CONTINUOUS",
+    allow_negative_rates: bool = True,
+) -> tuple[np.ndarray, np.ndarray, np.ndarray, str]:
+    _ensure_exactly_one(df_nodes, zero_nodes)
+    x_arr = _as_1d_array(x, "x")
+    _validate_non_negative_x(x_arr)
 
-    if side == "left":
-        x0, x1 = x_nodes[0], x_nodes[1]
-        df0, df1 = df_nodes[0], df_nodes[1]
-    else:
-        x0, x1 = x_nodes[-2], x_nodes[-1]
-        df0, df1 = df_nodes[-2], df_nodes[-1]
-    m = (np.log(df1) - np.log(df0)) / (x1 - x0)
-    anchor_x = x1 if side == "right" else x0
-    anchor_df = df1 if side == "right" else df0
-    return anchor_df * np.exp(m * (xq - anchor_x))
+    if df_nodes is not None:
+        df_arr = _as_1d_array(df_nodes, "df_nodes")
+        x_arr, df_arr = _sort_by_x(x_arr, df_arr)
+        _validate_strictly_increasing(x_arr, "x")
+        _validate_df(df_arr, allow_negative_rates=allow_negative_rates)
+        zero_arr = zero_rate_from_df(df_arr, x_arr, compounding)
+        return x_arr, df_arr, zero_arr, "DF"
 
-
-def _linear_zero_extrapolate(
-    x_nodes: np.ndarray, zero_nodes: np.ndarray, xq: np.ndarray, *, side: str
-) -> np.ndarray:
-    if x_nodes.size < 1:
-        raise ValueError("At least one node is required for extrapolation.")
-    
-    if x_nodes.size == 1:
-        return np.full_like(xq, zero_nodes[0])
-
-    if side == "left":
-        x0, x1 = x_nodes[0], x_nodes[1]
-        z0, z1 = zero_nodes[0], zero_nodes[1]
-    else:
-        x0, x1 = x_nodes[-2], x_nodes[-1]
-        z0, z1 = zero_nodes[-2], zero_nodes[-1]
-    slope = (z1 - z0) / (x1 - x0)
-    anchor_x = x1 if side == "right" else x0
-    anchor_z = z1 if side == "right" else z0
-    return anchor_z + slope * (xq - anchor_x)
-
-
-class _SegmentCase:
-    BASE_QUADRATIC = 0
-    FLAT_LEFT = 1
-    FLAT_RIGHT = 2
-    TWO_SIDED = 3
+    zero_arr = _as_1d_array(zero_nodes, "zero_nodes")
+    x_arr, zero_arr = _sort_by_x(x_arr, zero_arr)
+    _validate_strictly_increasing(x_arr, "x")
+    df_arr = discount_factor(zero_arr, x_arr, compounding)
+    _validate_df(df_arr, allow_negative_rates=allow_negative_rates)
+    return x_arr, df_arr, zero_arr, "ZERO"
 
 
 def _validate_strictly_increasing(x: np.ndarray, name: str) -> None:
-    if x.ndim != 1:
-        raise ValueError(f"{name} must be 1-D array.")
     if np.any(~np.isfinite(x)):
         raise ValueError(f"{name} contains NaN/inf.")
     if np.any(np.diff(x) <= 0.0):
@@ -90,121 +121,20 @@ def _validate_strictly_increasing(x: np.ndarray, name: str) -> None:
 
 
 def _validate_df(df: np.ndarray, allow_negative_rates: bool) -> None:
-    if df.ndim != 1:
-        raise ValueError("df must be 1-D array.")
     if np.any(~np.isfinite(df)):
         raise ValueError("df contains NaN/inf.")
     if np.any(df <= 0.0):
         raise ValueError("df must be > 0 for all nodes (log defined).")
     if not allow_negative_rates:
-        if np.any(np.diff(df) > 1e-14):
+        if np.any(np.diff(df) > DF_INC_EPS):
             raise ValueError(
                 "df is not non-increasing. "
                 "If negative rates are possible, set allow_negative_rates=True."
             )
 
 
-def _discrete_forward_from_df(t: np.ndarray, df: np.ndarray) -> np.ndarray:
-    dt = np.diff(t)
-    lnP = np.log(df)
-    return -(lnP[1:] - lnP[:-1]) / dt
-
-
-def _node_forward_from_discrete_forward(t: np.ndarray, f_d: np.ndarray) -> np.ndarray:
-    n = len(t) - 1
-    if len(f_d) != n:
-        raise ValueError("f_d length mismatch.")
-
-    f = np.empty(n + 1, dtype=float)
-    if n == 1:
-        f[0] = f_d[0]
-        f[1] = f_d[0]
-        return f
-
-    for i in range(1, n):
-        w1 = (t[i] - t[i - 1]) / (t[i + 1] - t[i - 1])
-        w2 = (t[i + 1] - t[i]) / (t[i + 1] - t[i - 1])
-        f[i] = w1 * f_d[i] + w2 * f_d[i - 1]
-
-    f[0] = f_d[0] - 0.5 * (f[1] - f_d[0])
-    f[n] = f_d[n - 1] - 0.5 * (f[n - 1] - f_d[n - 1])
-    return f
-
-
-def _collar_node_forwards(
-    f: np.ndarray,
-    f_d: np.ndarray,
-    allow_negative_rates: bool,
-    cap_factor: float = 2.0,
-) -> np.ndarray:
-    n = len(f) - 1
-    out = f.copy()
-    floor = -np.inf if allow_negative_rates else 0.0
-
-    out[0] = np.clip(out[0], floor, cap_factor * f_d[0])
-    out[n] = np.clip(out[n], floor, cap_factor * f_d[n - 1])
-    for i in range(1, n):
-        cap = cap_factor * min(f_d[i - 1], f_d[i])
-        out[i] = np.clip(out[i], floor, cap)
-    return out
-
-
-def _baseline_quadratic_coeffs(g0: float, g1: float) -> tuple[float, float, float]:
-    K = g0
-    L = -4.0 * g0 - 2.0 * g1
-    M = 3.0 * (g0 + g1)
-    return K, L, M
-
-
-def _decide_segment_case(g0: float, g1: float) -> tuple[int, float, float]:
-    if abs(g0) < 1e-16 and abs(g1) < 1e-16:
-        return _SegmentCase.BASE_QUADRATIC, 0.0, 0.0
-
-    gp0 = -4.0 * g0 - 2.0 * g1
-    gp1 = 2.0 * g0 + 4.0 * g1
-    direction = g1 - g0
-
-    def _is_monotone() -> bool:
-        if abs(direction) < 1e-16:
-            return True
-        if direction > 0.0:
-            return gp0 >= -1e-16 and gp1 >= -1e-16
-        return gp0 <= 1e-16 and gp1 <= 1e-16
-
-    if g0 * g1 > 0.0:
-        s = g0 + g1
-        eta = 0.5 if abs(s) < 1e-16 else g1 / s
-        eta = float(np.clip(eta, 1e-10, 1.0 - 1e-10))
-        A = -0.5 * (eta * g0 + (1.0 - eta) * g1)
-        return _SegmentCase.TWO_SIDED, eta, A
-
-    if _is_monotone():
-        return _SegmentCase.BASE_QUADRATIC, 0.0, 0.0
-
-    if direction > 0.0:
-        if gp0 < 0.0:
-            denom = g1 - g0
-            eta = 1.0 + 3.0 * g0 / denom
-            eta = float(np.clip(eta, 1e-10, 1.0 - 1e-10))
-            return _SegmentCase.FLAT_LEFT, eta, 0.0
-        denom = g1 - g0
-        eta = 3.0 * g1 / denom
-        eta = float(np.clip(eta, 1e-10, 1.0 - 1e-10))
-        return _SegmentCase.FLAT_RIGHT, eta, 0.0
-
-    if gp0 > 0.0:
-        denom = g1 - g0
-        eta = 1.0 + 3.0 * g0 / denom
-        eta = float(np.clip(eta, 1e-10, 1.0 - 1e-10))
-        return _SegmentCase.FLAT_LEFT, eta, 0.0
-    denom = g1 - g0
-    eta = 3.0 * g1 / denom
-    eta = float(np.clip(eta, 1e-10, 1.0 - 1e-10))
-    return _SegmentCase.FLAT_RIGHT, eta, 0.0
-
-
 @dataclass(frozen=True)
-class _MonotoneConvexSpline:
+class MonotoneConvexSpline:
     """Hagan–West Monotone Convex interpolation on DF space (vectorized evaluation)."""
 
     t: np.ndarray
@@ -217,6 +147,129 @@ class _MonotoneConvexSpline:
     eta: np.ndarray
     A: np.ndarray
 
+    class _SegmentCase:
+        BASE_QUADRATIC = 0
+        FLAT_LEFT = 1
+        FLAT_RIGHT = 2
+        TWO_SIDED = 3
+
+    @staticmethod
+    def _discrete_forward_from_df(t: np.ndarray, df: np.ndarray) -> np.ndarray:
+        dt = np.diff(t)
+        lnP = np.log(df)
+        return -(lnP[1:] - lnP[:-1]) / dt
+
+    @staticmethod
+    def _node_forward_from_discrete_forward(t: np.ndarray, f_d: np.ndarray) -> np.ndarray:
+        n = len(t) - 1
+        if len(f_d) != n:
+            raise ValueError("f_d length mismatch.")
+
+        f = np.empty(n + 1, dtype=float)
+        if n == 1:
+            f[0] = f_d[0]
+            f[1] = f_d[0]
+            return f
+
+        dt_prev = t[1:n] - t[0 : n - 1]
+        dt_next = t[2 : n + 1] - t[1:n]
+        denom = t[2 : n + 1] - t[0 : n - 1]
+        w1 = dt_prev / denom
+        w2 = dt_next / denom
+        f[1:n] = w1 * f_d[1:] + w2 * f_d[:-1]
+
+        f[0] = f_d[0] - 0.5 * (f[1] - f_d[0])
+        f[n] = f_d[n - 1] - 0.5 * (f[n - 1] - f_d[n - 1])
+        return f
+
+    @staticmethod
+    def _collar_node_forwards(
+        f: np.ndarray,
+        f_d: np.ndarray,
+        allow_negative_rates: bool,
+        cap_factor: float = 2.0,
+    ) -> np.ndarray:
+        n = len(f) - 1
+        out = f.copy()
+        floor = -np.inf if allow_negative_rates else 0.0
+
+        out[0] = np.clip(out[0], floor, cap_factor * f_d[0])
+        out[n] = np.clip(out[n], floor, cap_factor * f_d[n - 1])
+        if n > 1:
+            caps = cap_factor * np.minimum(f_d[:-1], f_d[1:])
+            out[1:n] = np.clip(out[1:n], floor, caps)
+        return out
+
+    @staticmethod
+    def _baseline_quadratic_coeffs(
+        g0: np.ndarray, g1: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        g0_arr = np.asarray(g0, dtype=float)
+        g1_arr = np.asarray(g1, dtype=float)
+        K = g0_arr
+        L = -4.0 * g0_arr - 2.0 * g1_arr
+        M = 3.0 * (g0_arr + g1_arr)
+        return K, L, M
+
+    @classmethod
+    def _compute_segment_params_vectorized(
+        cls, g0: np.ndarray, g1: np.ndarray
+    ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+        g0_arr = np.asarray(g0, dtype=float)
+        g1_arr = np.asarray(g1, dtype=float)
+        if g0_arr.shape != g1_arr.shape:
+            raise ValueError("g0 and g1 must have the same shape.")
+
+        n = g0_arr.size
+        case = np.full(n, cls._SegmentCase.BASE_QUADRATIC, dtype=int)
+        eta = np.zeros(n, dtype=float)
+        A = np.zeros(n, dtype=float)
+
+        zero_mask = (np.abs(g0_arr) < EPS) & (np.abs(g1_arr) < EPS)
+        same_sign = (g0_arr * g1_arr > 0.0) & ~zero_mask
+        if np.any(same_sign):
+            s = g0_arr + g1_arr
+            eta_ss = np.where(np.abs(s) < EPS, 0.5, g1_arr / s)
+            eta_ss = np.clip(eta_ss, ETA_EPS, 1.0 - ETA_EPS)
+            A_ss = -0.5 * (eta_ss * g0_arr + (1.0 - eta_ss) * g1_arr)
+            case[same_sign] = cls._SegmentCase.TWO_SIDED
+            eta[same_sign] = eta_ss[same_sign]
+            A[same_sign] = A_ss[same_sign]
+
+        remaining = ~same_sign & ~zero_mask
+        if np.any(remaining):
+            gp0 = -4.0 * g0_arr - 2.0 * g1_arr
+            gp1 = 2.0 * g0_arr + 4.0 * g1_arr
+            direction = g1_arr - g0_arr
+
+            monotone = remaining & (np.abs(direction) < EPS)
+            pos = remaining & (direction > 0.0)
+            neg = remaining & (direction < 0.0)
+            monotone |= pos & (gp0 >= -EPS) & (gp1 >= -EPS)
+            monotone |= neg & (gp0 <= EPS) & (gp1 <= EPS)
+
+            non_mono = remaining & ~monotone
+            if np.any(non_mono):
+                denom = g1_arr - g0_arr
+                flat_left = non_mono & (
+                    ((direction > 0.0) & (gp0 < 0.0)) | ((direction < 0.0) & (gp0 > 0.0))
+                )
+                flat_right = non_mono & ~flat_left
+
+                if np.any(flat_left):
+                    eta_left = 1.0 + 3.0 * g0_arr / denom
+                    eta_left = np.clip(eta_left, ETA_EPS, 1.0 - ETA_EPS)
+                    case[flat_left] = cls._SegmentCase.FLAT_LEFT
+                    eta[flat_left] = eta_left[flat_left]
+
+                if np.any(flat_right):
+                    eta_right = 3.0 * g1_arr / denom
+                    eta_right = np.clip(eta_right, ETA_EPS, 1.0 - ETA_EPS)
+                    case[flat_right] = cls._SegmentCase.FLAT_RIGHT
+                    eta[flat_right] = eta_right[flat_right]
+
+        return case, eta, A
+
     @classmethod
     def from_discount_factors(
         cls,
@@ -225,43 +278,31 @@ class _MonotoneConvexSpline:
         *,
         allow_negative_rates: bool = True,
         cap_factor: float = 2.0,
-    ) -> "_MonotoneConvexSpline":
+    ) -> "MonotoneConvexSpline":
         t = np.asarray(x, dtype=float)
         df = np.asarray(df_nodes, dtype=float)
 
-        _validate_strictly_increasing(t, "x")
-        _validate_df(df, allow_negative_rates=allow_negative_rates)
+        if t.size < 2:
+            raise ValueError("Monotone convex interpolation requires at least two nodes.")
 
         if t[0] > 0.0:
             t = np.concatenate(([0.0], t))
             df = np.concatenate(([1.0], df))
 
         dt = np.diff(t)
-        f_d = _discrete_forward_from_df(t, df)
-        f = _node_forward_from_discrete_forward(t, f_d)
-        f = _collar_node_forwards(
+        f_d = cls._discrete_forward_from_df(t, df)
+        f = cls._node_forward_from_discrete_forward(t, f_d)
+        f = cls._collar_node_forwards(
             f, f_d, allow_negative_rates=allow_negative_rates, cap_factor=cap_factor
         )
 
-        n = len(t) - 1
-        g0 = np.empty(n, dtype=float)
-        g1 = np.empty(n, dtype=float)
-        case = np.empty(n, dtype=int)
-        eta = np.empty(n, dtype=float)
-        A = np.empty(n, dtype=float)
-
-        for i in range(1, len(t)):
-            fd = float(f_d[i - 1])
-            fL = float(f[i - 1])
-            fR = float(f[i])
-            g0_i = fL - fd
-            g1_i = fR - fd
-            case_i, eta_i, A_i = _decide_segment_case(g0_i, g1_i)
-            g0[i - 1] = g0_i
-            g1[i - 1] = g1_i
-            case[i - 1] = case_i
-            eta[i - 1] = eta_i
-            A[i - 1] = A_i
+        # Vectorized calculation of g0, g1
+        # f_d has size n (intervals), f has size n+1 (nodes)
+        # interval i (0 to n-1) uses f[i] and f[i+1]
+        g0 = f[:-1] - f_d
+        g1 = f[1:] - f_d
+        
+        case, eta, A = cls._compute_segment_params_vectorized(g0, g1)
 
         return cls(
             t=t,
@@ -297,69 +338,72 @@ class _MonotoneConvexSpline:
 
         I_g = np.zeros_like(x)
 
-        mask = case == _SegmentCase.BASE_QUADRATIC
+        mask = case == self._SegmentCase.BASE_QUADRATIC
         if np.any(mask):
-            K, L, M = _baseline_quadratic_coeffs(g0[mask], g1[mask])
+            K, L, M = self._baseline_quadratic_coeffs(g0[mask], g1[mask])
             xm = x[mask]
             I_g[mask] = K * xm + 0.5 * L * xm * xm + (1.0 / 3.0) * M * xm * xm * xm
 
-        mask = case == _SegmentCase.FLAT_LEFT
+        mask = case == self._SegmentCase.FLAT_LEFT
         if np.any(mask):
-            idx_mask = np.where(mask)[0]
-            xm = x[idx_mask]
-            et = eta[idx_mask]
-            g0m = g0[idx_mask]
-            g1m = g1[idx_mask]
+            xm = x[mask]
+            et = eta[mask]
+            g0m = g0[mask]
+            g1m = g1[mask]
+            out = np.empty_like(xm)
             left = xm <= et
             if np.any(left):
-                I_g[idx_mask[left]] = g0m[left] * xm[left]
+                out[left] = g0m[left] * xm[left]
             if np.any(~left):
                 dx = xm[~left] - et[~left]
-                I_g[idx_mask[~left]] = g0m[~left] * xm[~left] + (
+                out[~left] = g0m[~left] * xm[~left] + (
                     (g1m[~left] - g0m[~left]) * (dx ** 3) / (3.0 * (1.0 - et[~left]) ** 2)
                 )
+            I_g[mask] = out
 
-        mask = case == _SegmentCase.FLAT_RIGHT
+        mask = case == self._SegmentCase.FLAT_RIGHT
         if np.any(mask):
-            idx_mask = np.where(mask)[0]
-            xm = x[idx_mask]
-            et = eta[idx_mask]
-            g0m = g0[idx_mask]
-            g1m = g1[idx_mask]
+            xm = x[mask]
+            et = eta[mask]
+            g0m = g0[mask]
+            g1m = g1[mask]
+            out = np.empty_like(xm)
             left = xm <= et
             if np.any(left):
                 term = (et[left] ** 3 - (et[left] - xm[left]) ** 3) / 3.0
-                I_g[idx_mask[left]] = g1m[left] * xm[left] + (
+                out[left] = g1m[left] * xm[left] + (
                     (g0m[left] - g1m[left]) * term / (et[left] ** 2)
                 )
             if np.any(~left):
                 I_eta = (2.0 / 3.0) * g1m[~left] * et[~left] + (1.0 / 3.0) * g0m[
                     ~left
                 ] * et[~left]
-                I_g[idx_mask[~left]] = I_eta + g1m[~left] * (xm[~left] - et[~left])
+                out[~left] = I_eta + g1m[~left] * (xm[~left] - et[~left])
+            I_g[mask] = out
 
-        mask = case == _SegmentCase.TWO_SIDED
+        mask = case == self._SegmentCase.TWO_SIDED
         if np.any(mask):
-            idx_mask = np.where(mask)[0]
-            xm = x[idx_mask]
-            et = eta[idx_mask]
-            g0m = g0[idx_mask]
-            g1m = g1[idx_mask]
-            Am = A[idx_mask]
+            xm = x[mask]
+            et = eta[mask]
+            g0m = g0[mask]
+            g1m = g1[mask]
+            Am = A[mask]
+            out = np.empty_like(xm)
             left = xm <= et
             if np.any(left):
                 term = (et[left] ** 3 - (et[left] - xm[left]) ** 3) / 3.0
-                I_g[idx_mask[left]] = Am[left] * xm[left] + (
+                out[left] = Am[left] * xm[left] + (
                     (g0m[left] - Am[left]) * term / (et[left] ** 2)
                 )
             if np.any(~left):
                 I_eta = et[~left] * ((2.0 / 3.0) * Am[~left] + (1.0 / 3.0) * g0m[~left])
                 dx = xm[~left] - et[~left]
-                I_g[idx_mask[~left]] = (
+                out[~left] = (
                     I_eta
                     + Am[~left] * dx
                     + (g1m[~left] - Am[~left]) * (dx ** 3) / (3.0 * (1.0 - et[~left]) ** 2)
                 )
+            I_g[mask] = out
 
         integral = fd * (x_flat - t_left) + dt * I_g
         df_left = self.df_nodes[idx]
@@ -368,150 +412,3 @@ class _MonotoneConvexSpline:
         if scalar:
             return df_vals[0]
         return df_vals.reshape(xq_arr.shape)
-
-
-@dataclass(frozen=True)
-class CurveInterpolator:
-    x: np.ndarray
-    df_nodes: np.ndarray
-    zero_nodes: np.ndarray
-    input_kind: str  # "DF" or "ZERO"
-    compounding: str
-    interp_method: str
-    extrap_left: str
-    extrap_right: str
-    _spline: Optional[object] = None
-
-    @classmethod
-    def from_nodes(
-        cls,
-        x: Iterable[float],
-        *,
-        df_nodes: Optional[Iterable[float]] = None,
-        zero_nodes: Optional[Iterable[float]] = None,
-        compounding: str = "CONTINUOUS",
-        interp_method: str = "LOG_LINEAR",
-        extrap_left: str = "FLAT_FWD",
-        extrap_right: str = "FLAT_FWD",
-    ) -> "CurveInterpolator":
-        if (df_nodes is None) == (zero_nodes is None):
-            raise ValueError("Provide exactly one of df_nodes or zero_nodes.")
-
-        x_arr = _to_numpy_1d(x, "x")
-        if np.any(x_arr < 0.0):
-            raise ValueError("x must be non-negative.")
-
-        if df_nodes is not None:
-            df_arr = _to_numpy_1d(df_nodes, "df_nodes")
-            x_arr, df_arr = _sort_xy(x_arr, df_arr)
-            if np.any(df_arr <= 0.0):
-                raise ValueError("Discount factors must be positive.")
-            zero_arr = np.array(
-                [zero_rate_from_df(df, t, compounding) for df, t in zip(df_arr, x_arr)]
-            )
-            input_kind = "DF"
-        else:
-            zero_arr = _to_numpy_1d(zero_nodes, "zero_nodes")
-            x_arr, zero_arr = _sort_xy(x_arr, zero_arr)
-            df_arr = np.array(
-                [discount_factor(r, t, compounding) for r, t in zip(zero_arr, x_arr)]
-            )
-            input_kind = "ZERO"
-
-        method = interp_method.upper()
-        spline = None
-        if method == "CUBIC_SPLINE":
-            spline = CubicSpline(x_arr, zero_arr, extrapolate=False)
-        elif method == "MONOTONE_CONVEX_SPLINE":
-            spline = _MonotoneConvexSpline.from_discount_factors(x_arr, df_arr)
-
-        return cls(
-            x=x_arr,
-            df_nodes=df_arr,
-            zero_nodes=zero_arr,
-            input_kind=input_kind,
-            compounding=compounding,
-            interp_method=method,
-            extrap_left=extrap_left.upper(),
-            extrap_right=extrap_right.upper(),
-            _spline=spline,
-        )
-
-    def value(self, xq: ArrayLike) -> np.ndarray:
-        if self.input_kind == "DF":
-            return self.df(xq)
-        return self.zero_rate(xq)
-
-    def df(self, xq: ArrayLike) -> np.ndarray:
-        xq_arr = np.asarray(xq, dtype=float)
-        scalar = xq_arr.ndim == 0
-        x_flat = xq_arr.reshape(-1)
-
-        result = np.empty_like(x_flat, dtype=float)
-        left_mask = x_flat < self.x[0]
-        right_mask = x_flat > self.x[-1]
-        mid_mask = ~(left_mask | right_mask)
-
-        if np.any(mid_mask):
-            result[mid_mask] = self._interp_df(x_flat[mid_mask])
-        if np.any(left_mask):
-            result[left_mask] = self._extrapolate(x_flat[left_mask], side="left")
-        if np.any(right_mask):
-            result[right_mask] = self._extrapolate(x_flat[right_mask], side="right")
-
-        if scalar:
-            return result[0]
-        return result.reshape(xq_arr.shape)
-
-    def zero_rate(self, xq: ArrayLike) -> np.ndarray:
-        df_vals = self.df(xq)
-        xq_arr = np.asarray(xq, dtype=float)
-        df_arr = np.asarray(df_vals, dtype=float).reshape(-1)
-        rates = np.array(
-            [
-                zero_rate_from_df(df, t, self.compounding)
-                for df, t in zip(df_arr, xq_arr.reshape(-1))
-            ]
-        ).reshape(xq_arr.shape)
-        if xq_arr.ndim == 0:
-            return rates[0]
-        return rates
-
-    def _interp_df(self, xq: np.ndarray) -> np.ndarray:
-        method = self.interp_method
-        if method == "LOG_LINEAR":
-            log_df = np.log(self.df_nodes)
-            log_vals = np.interp(xq, self.x, log_df)
-            return np.exp(log_vals)
-        if method == "MONOTONE_CONVEX_SPLINE":
-            if self._spline is None:
-                raise ValueError("Spline interpolator is not initialized.")
-            return self._spline.df(xq)
-
-        zero_vals = self._interp_zero(xq)
-        return np.array(
-            [discount_factor(r, t, self.compounding) for r, t in zip(zero_vals, xq)]
-        )
-
-    def _interp_zero(self, xq: np.ndarray) -> np.ndarray:
-        method = self.interp_method
-        if method == "LINEAR":
-            return np.interp(xq, self.x, self.zero_nodes)
-        if method == "CUBIC_SPLINE":
-            if self._spline is None:
-                raise ValueError("Spline interpolator is not initialized.")
-            return self._spline(xq)
-        raise ValueError(f"Unsupported interpolation method: {method!r}")
-
-    def _extrapolate(self, xq: np.ndarray, *, side: str) -> np.ndarray:
-        method = self.extrap_left if side == "left" else self.extrap_right
-        if method == "FLAT_FWD":
-            return _flat_forward_extrapolate(self.x, self.df_nodes, xq, side=side)
-        if method == "FLAT_ZERO":
-            idx = 0 if side == "left" else -1
-            z = self.zero_nodes[idx]
-            return discount_factor(z, xq, self.compounding)
-        if method == "LINEAR":
-            zeros = _linear_zero_extrapolate(self.x, self.zero_nodes, xq, side=side)
-            return discount_factor(zeros, xq, self.compounding)
-        raise ValueError(f"Unsupported extrapolation method: {method!r}")
