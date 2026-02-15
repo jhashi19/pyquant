@@ -1,71 +1,23 @@
 from __future__ import annotations
 
-from dataclasses import dataclass, field
 from datetime import date, timedelta
-from enum import Enum
 from typing import Iterable, Optional
 
-from ..math.bizday import (
+from app.engine.math.bizday import (
     BusinessCalendar,
     BusinessDayRule,
     add_business_days,
     adjust_business_day,
 )
-from ..math.date_utils import DateLike, add_months, is_end_of_month, to_date
-
-
-class StubType(Enum):
-    NONE = "NONE"
-    FRONT = "FRONT"
-    BACK = "BACK"
-    BOTH = "BOTH"
-
-
-@dataclass(frozen=True)
-class Tenor:
-    months: int = 0
-    days: int = 0
-
-    def is_zero(self) -> bool:
-        return self.months == 0 and self.days == 0
-
-    def negated(self) -> "Tenor":
-        return Tenor(-self.months, -self.days)
-
-    def is_month_based(self) -> bool:
-        return self.months != 0
-
-
-@dataclass(frozen=True)
-class CashflowPeriod:
-    unadjusted_start: date
-    unadjusted_end: date
-    accrual_start: date
-    accrual_end: date
-    payment_date: date
-    fixing_date: Optional[date] = None
-
-
-@dataclass(frozen=True)
-class LegScheduleSpec:
-    freq: str | Tenor
-    calendar: BusinessCalendar = field(default_factory=BusinessCalendar)
-    bdc: BusinessDayRule | str = BusinessDayRule.MOD_FOLLOWING
-    stub_type: StubType | str = StubType.BACK
-    first_date: Optional[DateLike] = None
-    last_date: Optional[DateLike] = None
-    eom: Optional[bool] = None
-    pay_lag: int = 0
-    accrual_bdc: Optional[BusinessDayRule | str] = None
-    accrual_calendar: Optional[BusinessCalendar] = None
-    fixing_lag: Optional[int] = None
-    fixing_calendar: Optional[BusinessCalendar] = None
-
-
-@dataclass(frozen=True)
-class SwapSchedule:
-    fixed_leg: tuple[CashflowPeriod, ...]
-    float_leg: tuple[CashflowPeriod, ...]
+from app.engine.math.date_utils import DateLike, add_months, is_end_of_month, to_date
+from app.engine.products.models.schedule_models import (
+    CashflowPeriod,
+    LegScheduleSpec,
+    StubType,
+    SwapSchedule,
+    Tenor,
+    TenorUnit,
+)
 
 
 def parse_tenor(value: str | Tenor) -> Tenor:
@@ -79,8 +31,10 @@ def parse_tenor(value: str | Tenor) -> Tenor:
         raise ValueError("Tenor must be non-empty.")
 
     unit = text[-1]
-    if unit not in {"D", "W", "M", "Y"}:
-        raise ValueError(f"Unsupported tenor unit: {value!r}")
+    try:
+        unit_enum = TenorUnit(unit)
+    except ValueError as exc:
+        raise ValueError(f"Unsupported tenor unit: {value!r}") from exc
 
     try:
         amount = int(text[:-1])
@@ -90,13 +44,17 @@ def parse_tenor(value: str | Tenor) -> Tenor:
     if amount <= 0:
         raise ValueError("Tenor amount must be positive.")
 
-    if unit == "D":
-        return Tenor(days=amount)
-    if unit == "W":
-        return Tenor(days=amount * 7)
-    if unit == "M":
-        return Tenor(months=amount)
-    return Tenor(months=amount * 12)
+    match unit_enum:
+        case TenorUnit.DAY:
+            return Tenor(days=amount)
+        case TenorUnit.WEEK:
+            return Tenor(days=amount * 7)
+        case TenorUnit.MONTH:
+            return Tenor(months=amount)
+        case TenorUnit.YEAR:
+            return Tenor(months=amount * 12)
+        case _:
+            raise ValueError(f"Unsupported tenor unit: {value!r}")
 
 
 def add_tenor(value: DateLike, tenor: Tenor, *, eom: Optional[bool] = None) -> date:
@@ -122,6 +80,10 @@ def normalize_stub_type(value: StubType | str) -> StubType:
             return StubType.FRONT
         case "BACK":
             return StubType.BACK
+        case "LONG_FRONT" | "LF":
+            return StubType.LONG_FRONT
+        case "LONG_BACK" | "LB":
+            return StubType.LONG_BACK
         case "BOTH":
             return StubType.BOTH
         case _:
@@ -146,20 +108,27 @@ def _extend_unique(target: list[date], values: Iterable[date]) -> None:
         _append_unique(target, d)
 
 
+def _shifted_date(base: date, tenor: Tenor, steps: int, *, eom: bool) -> date:
+    if steps == 0:
+        return base
+    step_tenor = Tenor(months=tenor.months * steps, days=tenor.days * steps)
+    return add_tenor(base, step_tenor, eom=eom)
+
+
 def _regular_dates_forward(
     start: date, end: date, tenor: Tenor, *, eom: bool
 ) -> tuple[list[date], bool]:
     dates = [start]
-    current = start
+    steps = 1
     while True:
-        nxt = add_tenor(current, tenor, eom=eom)
-        if nxt <= current:
+        nxt = _shifted_date(start, tenor, steps, eom=eom)
+        if nxt <= dates[-1]:
             raise ValueError("Tenor does not advance schedule.")
         if nxt >= end:
             stub = nxt != end
             break
         dates.append(nxt)
-        current = nxt
+        steps += 1
     dates.append(end)
     return dates, stub
 
@@ -168,17 +137,16 @@ def _regular_dates_backward(
     start: date, end: date, tenor: Tenor, *, eom: bool
 ) -> tuple[list[date], bool]:
     dates = [end]
-    current = end
-    step = tenor.negated()
+    steps = 1
     while True:
-        prev = add_tenor(current, step, eom=eom)
-        if prev >= current:
+        prev = _shifted_date(end, tenor, -steps, eom=eom)
+        if prev >= dates[-1]:
             raise ValueError("Tenor does not advance schedule.")
         if prev <= start:
             stub = prev != start
             break
         dates.append(prev)
-        current = prev
+        steps += 1
     dates.append(start)
     dates.reverse()
     return dates, stub
@@ -224,10 +192,16 @@ def build_unadjusted_schedule_dates(
     if tag == StubType.BOTH:
         raise ValueError("stub_type BOTH requires first_date and last_date.")
 
-    if tag == StubType.FRONT:
+    if tag in {StubType.FRONT, StubType.LONG_FRONT}:
         dates, stub = _regular_dates_backward(start_date, end_date, tenor_obj, eom=eom_flag)
     else:
         dates, stub = _regular_dates_forward(start_date, end_date, tenor_obj, eom=eom_flag)
+
+    if stub:
+        if tag == StubType.LONG_FRONT and len(dates) > 2:
+            dates.pop(1)
+        elif tag == StubType.LONG_BACK and len(dates) > 2:
+            dates.pop(-2)
 
     if tag == StubType.NONE and stub:
         raise ValueError("Schedule does not fit tenor with stub_type=NONE.")
@@ -238,12 +212,14 @@ def build_cashflow_periods(
     dates: Iterable[date],
     *,
     calendar: BusinessCalendar,
+    payment_calendar: Optional[BusinessCalendar] = None,
     bdc: BusinessDayRule | str,
     pay_lag: int = 0,
     accrual_bdc: Optional[BusinessDayRule | str] = None,
     accrual_calendar: Optional[BusinessCalendar] = None,
     fixing_lag: Optional[int] = None,
     fixing_calendar: Optional[BusinessCalendar] = None,
+    fixing_bdc: Optional[BusinessDayRule | str] = None,
 ) -> list[CashflowPeriod]:
     date_list = list(dates)
     if len(date_list) < 2:
@@ -251,8 +227,9 @@ def build_cashflow_periods(
 
     acc_bdc = accrual_bdc if accrual_bdc is not None else bdc
     acc_cal = accrual_calendar if accrual_calendar is not None else calendar
-    pay_cal = calendar
+    pay_cal = payment_calendar if payment_calendar is not None else calendar
     fix_cal = fixing_calendar if fixing_calendar is not None else calendar
+    fix_bdc = fixing_bdc if fixing_bdc is not None else BusinessDayRule.NONE
 
     periods: list[CashflowPeriod] = []
     for i in range(len(date_list) - 1):
@@ -267,9 +244,9 @@ def build_cashflow_periods(
             accrual_end = adjust_business_day(unadj_end, acc_bdc, acc_cal)
 
         if pay_lag:
-            pay_anchor = add_business_days(unadj_end, pay_lag, pay_cal)
+            pay_anchor = add_business_days(accrual_end, pay_lag, pay_cal)
         else:
-            pay_anchor = unadj_end
+            pay_anchor = accrual_end
 
         if _is_none_bdc(bdc):
             payment_date = pay_anchor
@@ -278,7 +255,11 @@ def build_cashflow_periods(
 
         fixing_date = None
         if fixing_lag is not None:
-            fixing_date = add_business_days(accrual_start, -fixing_lag, fix_cal)
+            fixing_anchor = add_business_days(accrual_start, -fixing_lag, fix_cal)
+            if _is_none_bdc(fix_bdc):
+                fixing_date = fixing_anchor
+            else:
+                fixing_date = adjust_business_day(fixing_anchor, fix_bdc, fix_cal)
 
         periods.append(
             CashflowPeriod(
@@ -318,12 +299,14 @@ def build_leg_schedule(
     periods = build_cashflow_periods(
         unadjusted,
         calendar=calendar,
+        payment_calendar=spec.payment_calendar,
         bdc=spec.bdc,
         pay_lag=spec.pay_lag,
         accrual_bdc=spec.accrual_bdc,
         accrual_calendar=spec.accrual_calendar,
         fixing_lag=spec.fixing_lag,
         fixing_calendar=spec.fixing_calendar,
+        fixing_bdc=spec.fixing_bdc,
     )
     return tuple(periods)
 

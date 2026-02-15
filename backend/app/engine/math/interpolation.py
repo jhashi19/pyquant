@@ -9,7 +9,6 @@ import numpy as np
 from .rate_conversion import discount_factor, zero_rate_from_df
 
 
-
 ArrayLike = Union[float, Iterable[float], np.ndarray]
 
 EPS = 1e-16
@@ -63,7 +62,8 @@ def normalize_extrap_method(method: ExtrapMethod | str) -> ExtrapMethod:
             raise ValueError(f"Unsupported extrapolation method: {method!r}")
 
 
-def _ensure_exactly_one(df_nodes: Optional[Iterable[float]], zero_nodes: Optional[Iterable[float]]) -> None:
+def _ensure_exactly_one(df_nodes: Optional[Iterable[float]],
+                        zero_nodes: Optional[Iterable[float]]) -> None:
     if (df_nodes is None) == (zero_nodes is None):
         raise ValueError("Provide exactly one of df_nodes or zero_nodes.")
 
@@ -105,6 +105,8 @@ def validate_curve_inputs(
         zero_arr = zero_rate_from_df(df_arr, x_arr, compounding)
         return x_arr, df_arr, zero_arr, "DF"
 
+    if zero_nodes is None:
+        raise ValueError("zero_nodes is required when df_nodes is None.")
     zero_arr = _as_1d_array(zero_nodes, "zero_nodes")
     x_arr, zero_arr = _sort_by_x(x_arr, zero_arr)
     _validate_strictly_increasing(x_arr, "x")
@@ -135,7 +137,8 @@ def _validate_df(df: np.ndarray, allow_negative_rates: bool) -> None:
 
 @dataclass(frozen=True)
 class MonotoneConvexSpline:
-    """Hagan–West Monotone Convex interpolation on DF space (vectorized evaluation)."""
+    """Hagan–West Monotone Convex interpolation on DF space
+    (vectorized evaluation)."""
 
     t: np.ndarray
     df_nodes: np.ndarray
@@ -160,7 +163,8 @@ class MonotoneConvexSpline:
         return -(lnP[1:] - lnP[:-1]) / dt
 
     @staticmethod
-    def _node_forward_from_discrete_forward(t: np.ndarray, f_d: np.ndarray) -> np.ndarray:
+    def _node_forward_from_discrete_forward(t: np.ndarray, f_d: np.ndarray
+                                            ) -> np.ndarray:
         n = len(t) - 1
         if len(f_d) != n:
             raise ValueError("f_d length mismatch.")
@@ -171,9 +175,9 @@ class MonotoneConvexSpline:
             f[1] = f_d[0]
             return f
 
-        dt_prev = t[1:n] - t[0 : n - 1]
-        dt_next = t[2 : n + 1] - t[1:n]
-        denom = t[2 : n + 1] - t[0 : n - 1]
+        dt_prev = t[1:n] - t[0: n - 1]
+        dt_next = t[2: n + 1] - t[1:n]
+        denom = t[2: n + 1] - t[0: n - 1]
         w1 = dt_prev / denom
         w2 = dt_next / denom
         f[1:n] = w1 * f_d[1:] + w2 * f_d[:-1]
@@ -301,7 +305,7 @@ class MonotoneConvexSpline:
         # interval i (0 to n-1) uses f[i] and f[i+1]
         g0 = f[:-1] - f_d
         g1 = f[1:] - f_d
-        
+
         case, eta, A = cls._compute_segment_params_vectorized(g0, g1)
 
         return cls(

@@ -40,8 +40,8 @@
 - 評価日tは変更可能とする(ただし、取引内容やレートの情報は評価日の変更に影響しない)
 - タイムゾーンはAsia/Tokyo
 #### 日数計算
-- ACT/ACTやACT/360などの日数計算規則はイールドカーブごとに設定可能とする
-- Modified Followingなどの営業日規則は取引ごとに設定可能とする
+- ACT/ACTやACT/360などの日数計算規則はイールドカーブごとや、クーポン、Accrualなどごとに設定可能とする
+- Modified Followingなどの営業日規則は取引ごとや、クーポン、Accrualなどごとに設定可能とする
 - 休日は土日以外も考慮する
 #### イールドカーブ
 - OIS
@@ -55,9 +55,10 @@
 - 金利先物：DCF法
 - FRA：DCF法
 - FXフォワード : カバード金利平価
-- ヨーロピアンFXオプション : Garman–Kohlhagen（Black, lognormal）
+- ヨーロピアンFXオプション : Garman–Kohlhagen
 - Cap/Floor : Black caplet(Shift付)
 - ヨーロピアンSwaption : Black swaption(Shift付)
+- オプションボラティリティの補間はSABRモデル
 
 ### その他の方針
 #### 計算結果

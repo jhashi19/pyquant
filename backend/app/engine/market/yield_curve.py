@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Iterable, Optional, overload
+from typing import Iterable, Optional, Protocol, overload
 
 import numpy as np
-from scipy.interpolate import CubicSpline
+from scipy.interpolate import CubicSpline  # type: ignore[import-untyped]
 
 from app.engine.math.extrapolation import flat_forward_extrapolate, linear_zero_extrapolate
 from app.engine.math.interpolation import (
@@ -19,6 +19,10 @@ from app.engine.math.interpolation import (
 from app.engine.math.rate_conversion import discount_factor, zero_rate_from_df
 
 
+class _SplineDF(Protocol):
+    def df(self, x: np.ndarray) -> np.ndarray: ...
+
+
 @dataclass(frozen=True)
 class CurveInterpolator:
     x: np.ndarray
@@ -29,7 +33,7 @@ class CurveInterpolator:
     interp_method: InterpMethod
     extrap_left: ExtrapMethod
     extrap_right: ExtrapMethod
-    _spline: Optional[object] = None
+    _spline: Optional[_SplineDF | CubicSpline] = None
 
     @classmethod
     def from_nodes(
@@ -138,6 +142,8 @@ class CurveInterpolator:
             case InterpMethod.CUBIC_SPLINE:
                 if self._spline is None:
                     raise ValueError("Spline interpolator is not initialized.")
+                if not isinstance(self._spline, CubicSpline):
+                    raise TypeError("CubicSpline interpolator is not initialized.")
                 zero_vals = self._spline(xq)
                 if output == "ZERO":
                     return zero_vals

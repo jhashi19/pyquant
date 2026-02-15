@@ -25,7 +25,7 @@ CREATE TABLE m_interp_method (
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 CREATE TABLE m_extrap_method (
-  extrap_method TEXT PRIMARY KEY,  -- 'FLAT_FWD','FLAT_ZERO','LINEAR_ZERO'など
+  extrap_method TEXT PRIMARY KEY,  -- 'FLAT_FWD','FLAT_ZERO','LINEAR_ZERO'
   description  TEXT,              -- 用途の説明
   created_at    TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
@@ -99,7 +99,7 @@ CREATE TABLE market_holiday (
 );
 
 CREATE TABLE ref_rate_rule (
-  index_id TEXT PRIMARY KEY,                        -- 'USD-SOFR','USD-SOFR-3M','JPY-TONAR' 等
+  index_id TEXT PRIMARY KEY,                        -- 'USD-SOFR','USD-SOFR-3M','JPY-TONAR' 等に加えて、必要な場合はlookbackやlockoutを含む識別子とする。
   ccy TEXT NOT NULL REFERENCES currency(ccy),
   tenor TEXT NOT NULL,                              -- 'ON','1M','3M' 等
   daycount TEXT NOT NULL REFERENCES daycount(code),
@@ -287,7 +287,7 @@ CREATE TABLE pricing_curve_def (
   curve_type    TEXT NOT NULL CHECK (curve_type IN ('OIS','FORECAST','BOND')),
 
   /* FORECAST のときのみ対象参照金利を要求（例：'JPY-TONAR','USD-SOFR'） */
-  ref_rate_id   TEXT,                                              -- NULL可（OIS/BOND）  
+  ref_rate_id   TEXT,                                              -- NULL可（OIS/BOND）
   /* 曲線“座標”の年率化と複利慣行（ゼロ↔DF 変換に使用） */
   daycount      TEXT NOT NULL REFERENCES daycount(code),
   compounding   TEXT NOT NULL DEFAULT 'CONTINUOUS'
@@ -422,6 +422,8 @@ CREATE TABLE IF NOT EXISTS bond_def (
   last_coupon_date   TEXT,                                     -- 最終クーポン（必要なら）
 
   settlement_days    INTEGER DEFAULT 2,                        -- 約定から決済までの営業日ラグ（T+2 等）
+  settlement_bdc     TEXT REFERENCES bizday_convention(code),  -- 決済日の営業日調整規則（未指定なら coupon_bdc 等を優先採用）
+  settlement_cal_id  TEXT REFERENCES calendar_def(cal_id),     -- 決済日の判定に用いるカレンダー（未指定なら coupon_cal_id 等を優先採用）
   prospectus_uri     TEXT,                                     -- 目論見書, term sheet 参照（任意）
   created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
   updated_at         TEXT
@@ -449,7 +451,7 @@ CREATE TABLE vol_fx (
   expiry_tenor   TEXT,                                           -- 例: '1W','1M','1Y'
   expiry_date    TEXT,                                           -- 例: '2026-03-31'
   x_years        REAL NOT NULL,                                  -- 年率時間（vol_time）
-  vol_daycount   TEXT NOT NULL DEFAULT 'ACT/365F' 
+  vol_daycount   TEXT NOT NULL DEFAULT 'ACT/365F'
                  REFERENCES daycount(code),                      -- ボラ年率化の規約（一般に ACT/365F）
 
   /* スマイル点の指定方法 */
@@ -1036,6 +1038,7 @@ CREATE TABLE IF NOT EXISTS trade_bond (
   issuer          TEXT,                                        -- 取引表示用の上書き（任意）
   redemption      REAL NOT NULL DEFAULT 100.0,                 -- 額面償還（%）
   settlement_ccy  TEXT NOT NULL REFERENCES currency(ccy),      -- 決済通貨（通常は券面通貨と同一）
+  clean_price_agreed REAL NOT NULL,                                 -- 約定単価（clean price）
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 
   -- 整合チェック（簡易）：タイプ別に主要必須の存在関係のみ担保
@@ -1212,30 +1215,133 @@ CREATE TABLE IF NOT EXISTS trade_fra (
   created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
 );
 
-CREATE TABLE trade_schedule (
-  trade_id       TEXT NOT NULL REFERENCES trade(trade_id) ON DELETE CASCADE,
-  leg_id         TEXT NOT NULL,       -- レッグ識別子：商品ごとに 'PAY' / 'REC' や 'LEG1' / 'LEG2' 等の文字列を使用
-  payment_date   TEXT NOT NULL,          -- 支払日
-  start_date     TEXT,                   -- 利息計算期間開始
-  end_date       TEXT,                   -- 利息計算期間終了
-  payment_type   TEXT NOT NULL,          -- 'INTEREST', 'PRINCIPAL', 'FEE' 等
-  ccy       TEXT NOT NULL REFERENCES currency(ccy),
-  notional       REAL,                   -- 計算基準元本
-  rate           REAL,                   -- 適用金利（変動の場合はFixing済み、未定ならNULL）
-  fixed_amount   REAL,                   -- 確定した支払額（Fixing後）
-  is_settled     INTEGER NOT NULL DEFAULT 0,      -- 決済済みフラグ：0=未決済, 1=決済済み
-  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  PRIMARY KEY (trade_id, leg_id, payment_date, payment_type)
+CREATE TABLE IF NOT EXISTS swap_schedule (
+  trade_id        TEXT NOT NULL REFERENCES trade(trade_id) ON DELETE CASCADE,
+  leg_id          TEXT NOT NULL,
+  cashflow_no     INTEGER NOT NULL,
+  payment_date    TEXT NOT NULL,
+  payment_type    TEXT NOT NULL CHECK (payment_type IN ('INTEREST','PRINCIPAL','FEE')),
+
+  pay_rec         TEXT NOT NULL CHECK (pay_rec IN ('PAY','REC')),
+  ccy             TEXT NOT NULL REFERENCES currency(ccy),
+
+  start_date      TEXT,
+  end_date        TEXT,
+  daycount        TEXT REFERENCES daycount(code),
+  accrual_factor  REAL,
+
+  notional        REAL,
+  principal_factor REAL,
+
+  index_id        TEXT REFERENCES ref_rate_rule(index_id),
+  spread          REAL,
+  gearing         REAL DEFAULT 1.0,
+  rate_calc_type  TEXT CHECK (rate_calc_type IN ('FIXED','IBOR_SINGLE','OIS_COMPOUNDED','OIS_AVERAGED','MANUAL')),
+
+  fixing_date     TEXT,
+  obs_start_date  TEXT,
+  obs_end_date    TEXT,
+
+  rate            REAL,
+  amount          REAL,
+  fixed_amount    REAL,
+
+  settled_amount  REAL,
+  is_settled      INTEGER NOT NULL DEFAULT 0 CHECK (is_settled IN (0,1)),
+  settled_date    TEXT,
+  settlement_ref  TEXT,
+
+  updated_at      TEXT,
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK (
+    payment_type <> 'INTEREST'
+    OR (
+      start_date IS NOT NULL
+      AND end_date IS NOT NULL
+      AND daycount IS NOT NULL
+      AND accrual_factor IS NOT NULL
+      AND notional IS NOT NULL
+    )
+  ),
+
+  PRIMARY KEY (trade_id, leg_id, cashflow_no)
 );
 
-/* 取引×レッグ単位での検索用 */
 
-/* 評価日別キャッシュフロー集計など、日付横断の検索用 */
-CREATE INDEX IF NOT EXISTS idx_trade_schedule_payment_date
-  ON trade_schedule(payment_date);
+CREATE INDEX IF NOT EXISTS idx_swap_schedule_trade_leg
+  ON swap_schedule(trade_id, leg_id);
 
-CREATE INDEX IF NOT EXISTS idx_trade_schedule_unsettled_date
-  ON trade_schedule(is_settled, payment_date);
+CREATE INDEX IF NOT EXISTS idx_swap_schedule_trade_leg_paydate
+  ON swap_schedule(trade_id, leg_id, payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_swap_schedule_index_fixing
+  ON swap_schedule(index_id, fixing_date);
+
+CREATE INDEX IF NOT EXISTS idx_swap_schedule_payment_date
+  ON swap_schedule(payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_swap_schedule_unsettled_date
+  ON swap_schedule(is_settled, payment_date);
+
+
+CREATE TABLE IF NOT EXISTS bond_schedule (
+  security_id          TEXT NOT NULL,
+  base_security_id     TEXT NOT NULL REFERENCES bond_def(security_id) ON DELETE CASCADE,
+  trade_id             TEXT REFERENCES trade(trade_id) ON DELETE CASCADE,
+
+  cashflow_no          INTEGER NOT NULL,
+  payment_date         TEXT NOT NULL,
+  payment_type         TEXT NOT NULL CHECK (payment_type IN ('INTEREST','PRINCIPAL')),
+  ccy                  TEXT NOT NULL REFERENCES currency(ccy),
+
+  start_date           TEXT,
+  end_date             TEXT,
+  daycount             TEXT REFERENCES daycount(code),
+  accrual_factor        REAL,
+
+  base_notional        REAL NOT NULL DEFAULT 100.0 CHECK (base_notional > 0.0),
+  notional_factor      REAL NOT NULL DEFAULT 1.0 CHECK (notional_factor > 0.0 AND notional_factor <= 1.0),
+  principal_factor     REAL NOT NULL DEFAULT 0.0 CHECK (principal_factor >= 0.0 AND principal_factor <= 1.0),
+
+  -- 金利決定（固定債/変動債を同一表で扱うための共通項目）
+  rate_calc_type       TEXT NOT NULL CHECK (rate_calc_type IN ('FIXED','IBOR_SINGLE','OIS_COMPOUNDED','OIS_AVERAGED','MANUAL')),
+  index_id             TEXT REFERENCES ref_rate_rule(index_id),
+  spread               REAL,
+  gearing              REAL DEFAULT 1.0,
+  fixing_date          TEXT,
+  obs_start_date       TEXT,
+  obs_end_date         TEXT,
+
+  rate                 REAL,
+  amount_per_base      REAL,
+  fixed_amount_per_base REAL,
+
+  is_stub              INTEGER NOT NULL DEFAULT 0 CHECK (is_stub IN (0,1)),
+  updated_at           TEXT,
+  created_at           TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK (
+    payment_type <> 'INTEREST'
+    OR (
+      start_date IS NOT NULL
+      AND end_date IS NOT NULL
+      AND daycount IS NOT NULL
+      AND accrual_factor IS NOT NULL
+    )
+  ),
+
+  PRIMARY KEY (security_id, cashflow_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_bond_schedule_security_payment
+  ON bond_schedule(security_id, payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_bond_schedule_base_security_payment
+  ON bond_schedule(base_security_id, payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_bond_schedule_trade_id
+  ON bond_schedule(trade_id);
 
 
 CREATE TABLE IF NOT EXISTS measure_def (
@@ -1346,6 +1452,65 @@ CREATE TABLE IF NOT EXISTS run_measure (
   PRIMARY KEY (run_id, measure_id)
 );
 
+/* run ごとの債券キャリブレーション状態（z-spread/経過利息など）
+   - 債券PV計算時に「市場クォートにフィットする z-spread」を一度だけ校正し、
+     以降（感応度・PL分解など）の計算では再校正せず入力として再利用するためのキャッシュ。
+   - 粒度は run × security × discount_curve × settle_date。
+*/
+CREATE TABLE IF NOT EXISTS run_bond_pricing_state (
+  run_id            TEXT NOT NULL REFERENCES run(run_id) ON DELETE CASCADE,
+  security_id       TEXT NOT NULL REFERENCES bond_def(security_id),
+
+  -- pricing_profile_map(md_role='DISCOUNT_CURVE') で解決された割引カーブ（curve_id）
+  discount_curve_id TEXT NOT NULL REFERENCES pricing_curve_def(curve_id),
+
+  -- 評価上の決済日（通常は as_of の T+N を暦調整した日）
+  settle_date       TEXT NOT NULL,                               -- 'YYYY-MM-DD'
+
+  -- 参照した市場クォート（トレース用）。NULL可（手入力・テスト等）
+  quote_id          TEXT REFERENCES market_quote_hdr(quote_id) ON DELETE SET NULL,
+
+  -- どの観測値にフィットしたか（価格は額面100あたり、YTMは年率の実数表現）
+  price_kind        TEXT NOT NULL CHECK (price_kind IN ('CLEAN','DIRTY')),
+  input_side        TEXT NOT NULL DEFAULT 'MID' CHECK (input_side IN ('MID','BID','ASK')),
+  price_value       REAL NOT NULL,
+
+  -- 価格通貨メタ（通常は bond_def.ccy と一致）。トレース用途で任意
+  price_ccy         TEXT REFERENCES currency(ccy),
+
+  -- 経過利息（settle_date 基準、額面100あたり）
+  accrued_interest  REAL NOT NULL,
+
+  -- 参照・デバッグ用：入力から整合変換した値（NULL可）
+  obs_clean_price   REAL,                                        -- 額面100あたり
+  obs_dirty_price   REAL,                                        -- 額面100あたり
+  obs_ytm           REAL,                                        -- 年率（実数表現）
+
+  -- 校正結果：z-spread（年率の実数表現。例: 12bp = 0.0012）
+  z_spread          REAL NOT NULL,
+
+  -- z-spread の適用規約（DFシフトに使用）
+  z_spread_daycount     TEXT NOT NULL REFERENCES daycount(code),
+  z_spread_compounding  TEXT NOT NULL DEFAULT 'CONTINUOUS'
+                      CHECK (z_spread_compounding IN ('CONTINUOUS','SIMPLE','DISCRETE')),
+  z_spread_compounding_freq INTEGER,                             -- DISCRETE のとき必須（例: 1,2,4,12,365）
+
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK ( (z_spread_compounding != 'DISCRETE') OR (z_spread_compounding_freq IS NOT NULL) ),
+
+  PRIMARY KEY (run_id, security_id, discount_curve_id, settle_date)
+);
+
+CREATE INDEX IF NOT EXISTS idx_run_bond_pricing_state_security
+  ON run_bond_pricing_state (security_id);
+
+CREATE INDEX IF NOT EXISTS idx_run_bond_pricing_state_quote
+  ON run_bond_pricing_state (quote_id);
+
+CREATE INDEX IF NOT EXISTS idx_run_bond_pricing_state_curve
+  ON run_bond_pricing_state (discount_curve_id);
+
 
 /* =========================
    評価結果
@@ -1386,7 +1551,7 @@ CREATE INDEX IF NOT EXISTS ix_result_eod_run_pltype
 
 -- 感応度の“点”定義（何を何でどう計算するか）
 CREATE TABLE IF NOT EXISTS sens_key_def (
-  sens_key_id     TEXT PRIMARY KEY, 
+  sens_key_id     TEXT PRIMARY KEY,
 
   measure_id      TEXT NOT NULL REFERENCES measure_def(measure_id), -- DV01/DELTA/Vega/Gamma...
   derivative_order INTEGER NOT NULL CHECK (derivative_order IN (1,2)),
