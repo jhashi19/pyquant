@@ -3,7 +3,13 @@ from __future__ import annotations
 from datetime import date
 from typing import Iterable, Optional
 
-from app.engine.math.bizday import BusinessCalendar
+import numpy as np
+
+from app.engine.math.bizday import (
+    BusinessCalendar,
+    add_business_days,
+    adjust_business_day,
+)
 from app.engine.math.daycount import year_fraction
 from app.engine.products.models.schedule_models import (
     HistoricalFixing,
@@ -12,6 +18,7 @@ from app.engine.products.models.schedule_models import (
     SwapScheduleRow,
     TradeHeader,
     TradeIRS,
+    TradeIRSAmortizingStep,
 )
 from app.engine.products.schedule_utils import build_leg_schedule
 
@@ -49,12 +56,50 @@ def _opposite_pay_rec(pay_rec: str) -> str:
     raise ValueError(f"Unsupported pay_rec: {pay_rec!r}")
 
 
+def _build_notional_resolver(
+    trade_notional: float,
+    amortizing_steps: Optional[Iterable[TradeIRSAmortizingStep]],
+):
+    steps = tuple(amortizing_steps or ())
+    if not steps:
+        return lambda payment_date: trade_notional
+
+    sorted_steps = sorted(steps, key=lambda s: (s.change_date, s.step_no))
+    change_ord = np.array([s.change_date.toordinal() for s in sorted_steps], dtype=np.int64)
+    ratios = np.array([float(s.notional_ratio) for s in sorted_steps], dtype=float)
+
+    def _resolve(payment_date: date) -> float:
+        idx = int(np.searchsorted(change_ord, payment_date.toordinal(), side="right") - 1)
+        if idx < 0:
+            return trade_notional
+        return trade_notional * ratios[idx]
+
+    return _resolve
+
+
+def _resolve_observation_window(
+    accrual_start: date,
+    accrual_end: date,
+    *,
+    rule: RefRateRule,
+    fixing_calendar: BusinessCalendar,
+) -> tuple[date, date]:
+    if rule.rate_type != "ON" or rule.lookback_days == 0:
+        return accrual_start, accrual_end
+    obs_start = add_business_days(accrual_start, -rule.lookback_days, fixing_calendar)
+    obs_end = add_business_days(accrual_end, -rule.lookback_days, fixing_calendar)
+    obs_start = adjust_business_day(obs_start, rule.fixing_bdc, fixing_calendar)
+    obs_end = adjust_business_day(obs_end, rule.fixing_bdc, fixing_calendar)
+    return obs_start, obs_end
+
+
 def build_swap_schedule_rows(
     trade: TradeHeader,
     irs: TradeIRS,
     ref_rate: RefRateRule,
     *,
     calendars: dict[str, BusinessCalendar],
+    amortizing_steps: Optional[Iterable[TradeIRSAmortizingStep]] = None,
     fixings: Optional[Iterable[HistoricalFixing]] = None,
 ) -> list[SwapScheduleRow]:
     if trade.effective_date is None or trade.maturity_date is None:
@@ -96,11 +141,13 @@ def build_swap_schedule_rows(
     ccy = irs.settle_ccy if irs.settle_ccy is not None else trade.ccy
     fixed_pay_rec = irs.pay_rec
     float_pay_rec = _opposite_pay_rec(irs.pay_rec)
+    resolve_notional = _build_notional_resolver(trade.notional, amortizing_steps)
 
     cashflow_no = 1
     for period in fixed_periods:
+        notional = resolve_notional(period.payment_date)
         accrual = year_fraction(period.accrual_start, period.accrual_end, irs.fixed_daycount)
-        amount = trade.notional * irs.fixed_rate * accrual
+        amount = notional * irs.fixed_rate * accrual
         rows.append(
             SwapScheduleRow(
                 trade_id=trade.trade_id,
@@ -114,7 +161,7 @@ def build_swap_schedule_rows(
                 end_date=period.accrual_end,
                 daycount=irs.fixed_daycount,
                 accrual_factor=accrual,
-                notional=trade.notional,
+                notional=notional,
                 principal_factor=0.0,
                 rate_calc_type="FIXED",
                 rate=irs.fixed_rate,
@@ -126,6 +173,14 @@ def build_swap_schedule_rows(
 
     cashflow_no = 1
     for period in float_periods:
+        notional = resolve_notional(period.payment_date)
+        obs_start, obs_end = _resolve_observation_window(
+            period.accrual_start,
+            period.accrual_end,
+            rule=ref_rate,
+            fixing_calendar=fix_cal,
+        )
+        accrual = year_fraction(period.accrual_start, period.accrual_end, irs.float_daycount)
         rate = None
         amount = None
         fixed_amount = None
@@ -133,8 +188,7 @@ def build_swap_schedule_rows(
             key = (irs.float_index_id, period.fixing_date)
             if key in fixing_map:
                 rate = fixing_map[key] + irs.float_spread
-                accrual = year_fraction(period.accrual_start, period.accrual_end, irs.float_daycount)
-                amount = trade.notional * rate * accrual
+                amount = notional * rate * accrual
                 fixed_amount = amount
         rows.append(
             SwapScheduleRow(
@@ -148,18 +202,16 @@ def build_swap_schedule_rows(
                 start_date=period.accrual_start,
                 end_date=period.accrual_end,
                 daycount=irs.float_daycount,
-                accrual_factor=year_fraction(
-                    period.accrual_start, period.accrual_end, irs.float_daycount
-                ),
-                notional=trade.notional,
+                accrual_factor=accrual,
+                notional=notional,
                 principal_factor=0.0,
                 index_id=irs.float_index_id,
                 spread=irs.float_spread,
                 gearing=1.0,
                 rate_calc_type=_float_rate_calc_type(ref_rate),
                 fixing_date=period.fixing_date,
-                obs_start_date=period.accrual_start,
-                obs_end_date=period.accrual_end,
+                obs_start_date=obs_start,
+                obs_end_date=obs_end,
                 rate=rate,
                 amount=amount,
                 fixed_amount=fixed_amount,

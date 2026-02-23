@@ -28,11 +28,13 @@ class SabrParams:
     beta: float
     rho: float
     nu: float
+    shift: float = 0.0
 
 
 @dataclass(frozen=True)
 class SabrCalibrationResult:
     params: SabrParams
+    shift: float
     success: bool
     status: int
     message: str
@@ -120,6 +122,24 @@ def _validate_params(params: SabrParams) -> None:
         raise ValueError("beta must be in [0, 1].")
     if not (-1.0 < params.rho < 1.0):
         raise ValueError("rho must be in (-1, 1).")
+    if not np.isfinite(params.shift):
+        raise ValueError("shift must be finite.")
+
+
+def _shifted_forward_and_strikes(
+    forward: float,
+    strikes: np.ndarray,
+    shift: float,
+    *,
+    vol_type: SabrVolType,
+) -> tuple[float, np.ndarray]:
+    shifted_forward = float(forward + shift)
+    shifted_strikes = strikes + shift
+    if shifted_forward <= 0.0 or np.any(shifted_strikes <= 0.0):
+        raise ValueError(
+            f"{vol_type.value} Shifted SABR requires forward+shift and strike+shift to be strictly positive."
+        )
+    return shifted_forward, shifted_strikes
 
 
 def _z_over_xz(z: np.ndarray, rho: float) -> np.ndarray:
@@ -133,16 +153,15 @@ def _z_over_xz(z: np.ndarray, rho: float) -> np.ndarray:
     return out
 
 
-def _sabr_lognormal_vol(forward: float, strikes: np.ndarray, expiry: float, params: SabrParams) -> np.ndarray:
-    _validate_params(params)
-    if forward <= 0.0 or np.any(strikes <= 0.0):
-        raise ValueError("LOGNORMAL SABR requires strictly positive forward and strikes.")
-
-    alpha = params.alpha
-    beta = params.beta
-    rho = params.rho
-    nu = params.nu
-
+def _sabr_lognormal_kernel(
+    forward: float,
+    strikes: np.ndarray,
+    expiry: float,
+    alpha: float,
+    beta: float,
+    rho: float,
+    nu: float,
+) -> np.ndarray:
     fk = forward * strikes
     log_fk = np.log(forward / strikes)
     one_minus_beta = 1.0 - beta
@@ -178,16 +197,36 @@ def _sabr_lognormal_vol(forward: float, strikes: np.ndarray, expiry: float, para
     return vols
 
 
-def _sabr_normal_vol(forward: float, strikes: np.ndarray, expiry: float, params: SabrParams) -> np.ndarray:
-    _validate_params(params)
-    if forward <= 0.0 or np.any(strikes <= 0.0):
-        raise ValueError("NORMAL SABR implementation currently requires positive forward and strikes.")
+def _sabr_lognormal_vol(
+    forward: float,
+    strikes: np.ndarray,
+    expiry: float,
+    params: SabrParams,
+    *,
+    validate_inputs: bool = True,
+) -> np.ndarray:
+    if validate_inputs:
+        _validate_params(params)
+        forward, strikes = _shifted_forward_and_strikes(
+            forward, strikes, params.shift, vol_type=SabrVolType.LOGNORMAL
+        )
+    else:
+        forward = float(forward + params.shift)
+        strikes = strikes + params.shift
+    return _sabr_lognormal_kernel(
+        forward, strikes, expiry, params.alpha, params.beta, params.rho, params.nu
+    )
 
-    alpha = params.alpha
-    beta = params.beta
-    rho = params.rho
-    nu = params.nu
 
+def _sabr_normal_kernel(
+    forward: float,
+    strikes: np.ndarray,
+    expiry: float,
+    alpha: float,
+    beta: float,
+    rho: float,
+    nu: float,
+) -> np.ndarray:
     fk = forward * strikes
     log_fk = np.log(forward / strikes)
     beta_factor = 1.0 - beta
@@ -219,6 +258,27 @@ def _sabr_normal_vol(forward: float, strikes: np.ndarray, expiry: float, params:
         )
         vols[atm_mask] = alpha * f_pow_beta * (1.0 + atm_corr * expiry)
     return vols
+
+
+def _sabr_normal_vol(
+    forward: float,
+    strikes: np.ndarray,
+    expiry: float,
+    params: SabrParams,
+    *,
+    validate_inputs: bool = True,
+) -> np.ndarray:
+    if validate_inputs:
+        _validate_params(params)
+        forward, strikes = _shifted_forward_and_strikes(
+            forward, strikes, params.shift, vol_type=SabrVolType.NORMAL
+        )
+    else:
+        forward = float(forward + params.shift)
+        strikes = strikes + params.shift
+    return _sabr_normal_kernel(
+        forward, strikes, expiry, params.alpha, params.beta, params.rho, params.nu
+    )
 
 
 def sabr_implied_vol(
@@ -266,16 +326,29 @@ def _pack_initial_value(name: str, value: float) -> float:
             raise ValueError(f"Unknown SABR parameter: {name!r}")
 
 
-def _unpack_value(name: str, x: float) -> float:
-    match name:
-        case "alpha" | "nu":
-            return float(np.exp(x))
-        case "beta":
-            return _sigmoid(x)
-        case "rho":
-            return float(np.tanh(x))
-        case _:
-            raise ValueError(f"Unknown SABR parameter: {name!r}")
+def _unpack_alpha(x: float) -> float:
+    return float(np.exp(x))
+
+
+def _unpack_beta(x: float) -> float:
+    return _sigmoid(x)
+
+
+def _unpack_rho(x: float) -> float:
+    return float(np.tanh(x))
+
+
+def _unpack_nu(x: float) -> float:
+    return float(np.exp(x))
+
+
+_PARAM_INDEX: dict[str, int] = {"alpha": 0, "beta": 1, "rho": 2, "nu": 3}
+_UNPACK_BY_NAME = {
+    "alpha": _unpack_alpha,
+    "beta": _unpack_beta,
+    "rho": _unpack_rho,
+    "nu": _unpack_nu,
+}
 
 
 def _default_initial_guess(
@@ -283,17 +356,19 @@ def _default_initial_guess(
     strikes: np.ndarray,
     market_vols: np.ndarray,
     forward: float,
+    shift: float,
     vol_type: SabrVolType,
     fixed: Mapping[str, float],
 ) -> dict[str, float]:
     idx_atm = int(np.argmin(np.abs(strikes - forward)))
     vol_atm = float(market_vols[idx_atm])
     beta = float(fixed.get("beta", 0.5))
+    shifted_forward = max(forward + shift, 1e-8)
     alpha_guess = vol_atm
     if vol_type == SabrVolType.LOGNORMAL:
-        alpha_guess = vol_atm * np.power(max(forward, 1e-8), 1.0 - beta)
+        alpha_guess = vol_atm * np.power(shifted_forward, 1.0 - beta)
     elif vol_type == SabrVolType.NORMAL:
-        alpha_guess = vol_atm / np.power(max(forward, 1e-8), beta)
+        alpha_guess = vol_atm / np.power(shifted_forward, beta)
     return {
         "alpha": max(alpha_guess, 1e-6),
         "beta": np.clip(beta, 0.0, 1.0),
@@ -310,6 +385,7 @@ def calibrate_sabr(
     *,
     vol_type: SabrVolType | str = SabrVolType.LOGNORMAL,
     preset: SabrCalibrationPreset | str = SabrCalibrationPreset.BETA_50,
+    shift: float = 0.0,
     fixed_params: Optional[Mapping[str, float]] = None,
     initial_guess: Optional[Mapping[str, float]] = None,
     weights: Optional[Sequence[float] | np.ndarray] = None,
@@ -323,6 +399,12 @@ def calibrate_sabr(
     _check_inputs(forward, expiry, strike_arr, market_arr)
     vtype = _normalize_vol_type(vol_type)
     preset_tag = _normalize_preset(preset)
+    shifted_forward, shifted_strikes = _shifted_forward_and_strikes(
+        forward, strike_arr, float(shift), vol_type=vtype
+    )
+    model_kernel = (
+        _sabr_lognormal_kernel if vtype == SabrVolType.LOGNORMAL else _sabr_normal_kernel
+    )
 
     fixed: dict[str, float] = dict(_PRESET_FIXED[preset_tag])
     if fixed_params is not None:
@@ -335,6 +417,7 @@ def calibrate_sabr(
         strikes=strike_arr,
         market_vols=market_arr,
         forward=forward,
+        shift=float(shift),
         vol_type=vtype,
         fixed=fixed,
     )
@@ -352,16 +435,26 @@ def calibrate_sabr(
         beta=defaults["beta"],
         rho=defaults["rho"],
         nu=defaults["nu"],
+        shift=float(shift),
     )
     _validate_params(params_probe)
 
     free_names = tuple(name for name in _PARAMETER_NAMES if name not in fixed)
     if len(free_names) == 0:
-        model = sabr_implied_vol(strike_arr, forward, expiry, params_probe, vol_type=vtype)
+        model = model_kernel(
+            shifted_forward,
+            shifted_strikes,
+            expiry,
+            params_probe.alpha,
+            params_probe.beta,
+            params_probe.rho,
+            params_probe.nu,
+        )
         residuals = model - market_arr
         rmse = float(np.sqrt(np.mean(residuals * residuals)))
         return SabrCalibrationResult(
             params=params_probe,
+            shift=float(shift),
             success=True,
             status=0,
             message="No free parameter to calibrate.",
@@ -390,21 +483,32 @@ def calibrate_sabr(
         w_sqrt = np.sqrt(w)
 
     x0 = np.array([_pack_initial_value(name, defaults[name]) for name in free_names], dtype=float)
+    free_indices = tuple(_PARAM_INDEX[name] for name in free_names)
+    free_unpackers = tuple(_UNPACK_BY_NAME[name] for name in free_names)
+    param_template = [
+        float(defaults["alpha"]),
+        float(defaults["beta"]),
+        float(defaults["rho"]),
+        float(defaults["nu"]),
+    ]
 
-    def _build_params(x: np.ndarray) -> SabrParams:
-        values = dict(defaults)
-        for i, name in enumerate(free_names):
-            values[name] = _unpack_value(name, float(x[i]))
-        return SabrParams(
-            alpha=float(values["alpha"]),
-            beta=float(values["beta"]),
-            rho=float(values["rho"]),
-            nu=float(values["nu"]),
-        )
+    def _build_values(x: np.ndarray) -> list[float]:
+        values = [param_template[0], param_template[1], param_template[2], param_template[3]]
+        for i, idx in enumerate(free_indices):
+            values[idx] = free_unpackers[i](float(x[i]))
+        return values
 
     def _residual(x: np.ndarray) -> np.ndarray:
-        p = _build_params(x)
-        model = sabr_implied_vol(strike_arr, forward, expiry, p, vol_type=vtype)
+        values = _build_values(x)
+        model = model_kernel(
+            shifted_forward,
+            shifted_strikes,
+            expiry,
+            values[0],
+            values[1],
+            values[2],
+            values[3],
+        )
         return (model - market_arr) * w_sqrt
 
     opt = least_squares(
@@ -417,12 +521,28 @@ def calibrate_sabr(
         max_nfev=max_nfev,
     )
 
-    calibrated = _build_params(opt.x)
-    model_vols = sabr_implied_vol(strike_arr, forward, expiry, calibrated, vol_type=vtype)
+    calibrated_values = _build_values(opt.x)
+    calibrated = SabrParams(
+        alpha=calibrated_values[0],
+        beta=calibrated_values[1],
+        rho=calibrated_values[2],
+        nu=calibrated_values[3],
+        shift=float(shift),
+    )
+    model_vols = model_kernel(
+        shifted_forward,
+        shifted_strikes,
+        expiry,
+        calibrated.alpha,
+        calibrated.beta,
+        calibrated.rho,
+        calibrated.nu,
+    )
     residuals = model_vols - market_arr
     rmse = float(np.sqrt(np.mean(residuals * residuals)))
     return SabrCalibrationResult(
         params=calibrated,
+        shift=float(shift),
         success=bool(opt.success),
         status=int(opt.status),
         message=str(opt.message),

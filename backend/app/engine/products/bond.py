@@ -138,13 +138,26 @@ def _pv_from_cashflows(
     z_spread_compounding: Compounding | str,
     z_spread_freq: int,
 ) -> float:
-    t_curve = _year_fractions_from_dates(as_of, cashflow_dates, curve_daycount)
-    t_z = _year_fractions_from_dates(as_of, cashflow_dates, z_spread_daycount)
+    dates = tuple(cashflow_dates)
+    t_curve = _year_fractions_from_dates(as_of, dates, curve_daycount)
+    t_z = _year_fractions_from_dates(as_of, dates, z_spread_daycount)
     df_curve = np.asarray(curve.df(t_curve), dtype=float)
     df_adj = _apply_z_spread(
         df_curve, t_z, z_spread, compounding=z_spread_compounding, freq=z_spread_freq
     )
     return float(np.sum(cashflow_amounts * df_adj))
+
+
+def _pv_from_precomputed_curve(
+    cashflow_curve_leg: np.ndarray,
+    t_z: np.ndarray,
+    z_spread: float,
+    *,
+    z_spread_compounding: Compounding | str,
+    z_spread_freq: int,
+) -> float:
+    z_df = discount_factor(z_spread, t_z, z_spread_compounding, freq=z_spread_freq)
+    return float(np.sum(cashflow_curve_leg * z_df))
 
 
 def _bracket_root(func, x0: float, step: float, max_steps: int) -> tuple[float, float]:
@@ -179,15 +192,17 @@ def calibrate_z_spread(
     z_spread_compounding: Compounding | str,
     z_spread_freq: int,
 ) -> float:
+    dates = tuple(cashflow_dates)
+    t_curve = _year_fractions_from_dates(as_of, dates, curve_daycount)
+    t_z = _year_fractions_from_dates(as_of, dates, z_spread_daycount)
+    df_curve = np.asarray(curve.df(t_curve), dtype=float)
+    cashflow_curve_leg = cashflow_amounts * df_curve
+
     def _objective(z: float) -> float:
-        pv = _pv_from_cashflows(
-            curve,
-            cashflow_dates,
-            cashflow_amounts,
-            as_of=as_of,
-            curve_daycount=curve_daycount,
+        pv = _pv_from_precomputed_curve(
+            cashflow_curve_leg,
+            t_z,
             z_spread=z,
-            z_spread_daycount=z_spread_daycount,
             z_spread_compounding=z_spread_compounding,
             z_spread_freq=z_spread_freq,
         )
@@ -257,21 +272,63 @@ def _resolve_bond_terms(bond_def: BondDef, trade_bond: TradeBond) -> BondDef:
     )
 
 
-def _resolve_dirty_price(quote: MarketQuoteBond, side: str) -> float:
+def _accrued_price_per_100(accrued_amount: float, notional: float) -> float:
+    if notional == 0.0:
+        raise ValueError("trade.notional must not be zero.")
+    return accrued_amount * 100.0 / notional
+
+
+def _resolve_side_price(
+    *,
+    side: str,
+    mid: Optional[float],
+    bid: Optional[float],
+    ask: Optional[float],
+) -> Optional[float]:
     key = side.upper()
     if key == "MID":
-        if quote.dirty_price_mid is None:
-            raise ValueError("dirty_price_mid is required for MID pricing.")
-        return quote.dirty_price_mid
+        return mid
     if key == "BID":
-        if quote.dirty_price_bid is None:
-            raise ValueError("dirty_price_bid is required for BID pricing.")
-        return quote.dirty_price_bid
+        return bid
     if key == "ASK":
-        if quote.dirty_price_ask is None:
-            raise ValueError("dirty_price_ask is required for ASK pricing.")
-        return quote.dirty_price_ask
+        return ask
     raise ValueError(f"Unsupported input_side: {side!r}")
+
+
+def _resolve_input_prices(
+    quote: MarketQuoteBond,
+    trade_bond: TradeBond,
+    side: str,
+    *,
+    accrued_price_per_100: float,
+) -> tuple[float, float]:
+    dirty = _resolve_side_price(
+        side=side,
+        mid=quote.dirty_price_mid,
+        bid=quote.dirty_price_bid,
+        ask=quote.dirty_price_ask,
+    )
+    clean = _resolve_side_price(
+        side=side,
+        mid=quote.clean_price_mid,
+        bid=quote.clean_price_bid,
+        ask=quote.clean_price_ask,
+    )
+
+    if dirty is None and clean is None:
+        clean = trade_bond.clean_price_agreed
+        if clean is None:
+            raise ValueError(
+                "Neither dirty nor clean market quote is available, and trade clean price is missing."
+            )
+
+    if dirty is None:
+        if clean is None:
+            raise ValueError("clean price is required when dirty price is unavailable.")
+        dirty = clean + accrued_price_per_100
+    if clean is None:
+        clean = dirty - accrued_price_per_100
+    return float(dirty), float(clean)
 
 
 def _aggregate_cashflows_from_bond_schedule(
@@ -509,9 +566,14 @@ def fixed_bond_pv(
     if cached_state is not None:
         z_spread = cached_state.z_spread
     else:
-        dirty = _resolve_dirty_price(quote, pricing.input_side)
+        accrued_price = _accrued_price_per_100(accrued, trade.notional)
+        dirty, obs_clean = _resolve_input_prices(
+            quote,
+            trade_bond,
+            pricing.input_side,
+            accrued_price_per_100=accrued_price,
+        )
         obs_dirty = dirty
-        obs_clean = dirty - accrued
         target_dirty = dirty * trade.notional / 100.0
         z_spread = calibrate_z_spread(
             target_dirty,
@@ -536,7 +598,7 @@ def fixed_bond_pv(
                     input_side=pricing.input_side,
                     price_value=dirty,
                     price_ccy=quote.quote_ccy,
-                    accrued_interest=accrued * 100.0 / trade.notional,
+                    accrued_interest=accrued_price,
                     obs_clean_price=obs_clean,
                     obs_dirty_price=obs_dirty,
                     z_spread=z_spread,
@@ -633,9 +695,14 @@ def float_bond_pv(
     if cached_state is not None:
         z_spread = cached_state.z_spread
     else:
-        dirty = _resolve_dirty_price(quote, pricing.input_side)
+        accrued_price = _accrued_price_per_100(accrued, trade.notional)
+        dirty, obs_clean = _resolve_input_prices(
+            quote,
+            trade_bond,
+            pricing.input_side,
+            accrued_price_per_100=accrued_price,
+        )
         obs_dirty = dirty
-        obs_clean = dirty - accrued
         target_dirty = dirty * trade.notional / 100.0
         z_spread = calibrate_z_spread(
             target_dirty,
@@ -660,7 +727,7 @@ def float_bond_pv(
                     input_side=pricing.input_side,
                     price_value=dirty,
                     price_ccy=quote.quote_ccy,
-                    accrued_interest=accrued * 100.0 / trade.notional,
+                    accrued_interest=accrued_price,
                     obs_clean_price=obs_clean,
                     obs_dirty_price=obs_dirty,
                     z_spread=z_spread,
@@ -728,9 +795,14 @@ def zero_coupon_bond_pv(
     if cached_state is not None:
         z_spread = cached_state.z_spread
     else:
-        dirty = _resolve_dirty_price(quote, pricing.input_side)
+        accrued_price = _accrued_price_per_100(accrued, trade.notional)
+        dirty, obs_clean = _resolve_input_prices(
+            quote,
+            trade_bond,
+            pricing.input_side,
+            accrued_price_per_100=accrued_price,
+        )
         obs_dirty = dirty
-        obs_clean = dirty
         target_dirty = dirty * trade.notional / 100.0
         z_spread = calibrate_z_spread(
             target_dirty,

@@ -83,6 +83,7 @@ class TradeHeader:
     trade_date: date
     effective_date: Optional[date]
     maturity_date: Optional[date]
+    pricing_profile_id: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -110,6 +111,9 @@ class BondDef:
 @dataclass(frozen=True)
 class MarketQuoteBond:
     security_id: str
+    clean_price_mid: Optional[float] = None
+    clean_price_bid: Optional[float] = None
+    clean_price_ask: Optional[float] = None
     dirty_price_mid: Optional[float] = None
     dirty_price_bid: Optional[float] = None
     dirty_price_ask: Optional[float] = None
@@ -131,6 +135,55 @@ class TradeBond:
     issuer: Optional[str]
     redemption: float
     settlement_ccy: str
+    clean_price_agreed: Optional[float] = None
+
+
+@dataclass(frozen=True)
+class TradeCapFloor:
+    trade_id: str
+    ccy: str
+    cp_flag: str
+    index_id: str
+    index_tenor: str
+    strike_rate: float
+    start_date: date
+    end_date: date
+    pay_rec: str
+    pay_freq: str
+    pay_bdc: BusinessDayRule | str
+    pay_cal_id: str
+
+
+@dataclass(frozen=True)
+class TradeSwaption:
+    trade_id: str
+    ccy: str
+    option_style: str
+    cp_flag: str
+    expiry_date: date
+    exercise_open: Optional[date]
+    exercise_close: Optional[date]
+    settlement: str
+    cash_settle_method: Optional[str]
+    cash_settle_lag_bd: Optional[int]
+    cash_settle_bdc: Optional[BusinessDayRule | str]
+    cash_settle_cal_id: Optional[str]
+    swap_pay_rec: str
+    swap_fixed_rate: Optional[float]
+    swap_fixed_dc: str
+    swap_fixed_freq: str
+    swap_fixed_bdc: BusinessDayRule | str
+    swap_fixed_cal: str
+    swap_index_id: str
+    swap_index_tenor: str
+    swap_spread: float
+    swap_float_dc: str
+    swap_float_freq: str
+    swap_float_bdc: BusinessDayRule | str
+    swap_float_cal: str
+    swap_start_date: Optional[date]
+    swap_spot_lag_bd: int
+    swap_maturity: date
 
 
 @dataclass(frozen=True)
@@ -152,6 +205,13 @@ class TradeIRS:
     settle_ccy: Optional[str]
 
 
+@dataclass(frozen=True)
+class TradeIRSAmortizingStep:
+    trade_id: str
+    step_no: int
+    change_date: date
+    notional_ratio: float
+
 
 @dataclass(frozen=True)
 class RefRateRule:
@@ -169,6 +229,25 @@ class HistoricalFixing:
     index_id: str
     fixing_date: date
     rate: float
+
+
+@dataclass(frozen=True)
+class ModelParamRow:
+    snapshot_id: str
+    model_tag: str
+    scope: str
+    param_key: str
+    expiry_tenor: Optional[str]
+    expiry_date: Optional[date]
+    x_years: Optional[float]
+    swap_tenor: Optional[str]
+    strike_rate: Optional[float]
+    moneyness: Optional[float]
+    param_name: str
+    param_val: float
+    param_unit: Optional[str] = None
+    source_symbol: Optional[str] = None
+    note: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -211,13 +290,13 @@ class BondScheduleRow:
     payment_date: date
     payment_type: str
     ccy: str
+    base_notional: float
+    notional_factor: float
+    principal_factor: float
     start_date: Optional[date] = None
     end_date: Optional[date] = None
     daycount: Optional[str] = None
     accrual_factor: Optional[float] = None
-    base_notional: float
-    notional_factor: float
-    principal_factor: float
     rate_calc_type: Optional[str] = None
     index_id: Optional[str] = None
     spread: Optional[float] = None
@@ -229,3 +308,34 @@ class BondScheduleRow:
     amount_per_base: Optional[float] = None
     fixed_amount_per_base: Optional[float] = None
     is_stub: int = 0
+
+
+@dataclass(frozen=True)
+class CapFloorScheduleRow:
+    trade_id: str
+    cashflow_no: int
+    payment_date: date
+    ccy: str
+    cp_flag: str
+    pay_rec: str
+    start_date: date
+    end_date: date
+    daycount: str
+    accrual_factor: float
+    notional: float
+    strike_rate: float
+    index_id: str
+    rate_calc_type: str
+    fixing_date: Optional[date] = None
+    obs_start_date: Optional[date] = None
+    obs_end_date: Optional[date] = None
+    observed_rate: Optional[float] = None
+    forward_rate: Optional[float] = None
+    payoff_rate: Optional[float] = None
+    amount: Optional[float] = None
+    fixed_amount: Optional[float] = None
+    is_fixed: int = 0
+    is_settled: int = 0
+    settled_amount: Optional[float] = None
+    settled_date: Optional[date] = None
+    settlement_ref: Optional[str] = None

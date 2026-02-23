@@ -530,7 +530,9 @@ CREATE TABLE vol_capfloor (
   strike_rate    REAL,                                            -- 'STRIKE' のとき必須（実数、例: 0.01=1%）
 
   /* クォート種別と値 */
-  quote_type     TEXT NOT NULL CHECK (quote_type IN ('LN_VOL','N_VOL')),
+  quote_type     TEXT NOT NULL CHECK (quote_type IN ('LN_VOL','N_VOL','SLN_VOL')),
+  quote_shift    REAL,                                            -- quote_type='SLN_VOL' のとき必須（絶対シフト）
+  sabr_shift     REAL NOT NULL DEFAULT 0.0,                      -- Shifted SABR の絶対シフト量（例: 0.02）
   sigma          REAL NOT NULL,
 
   /* 監査メタ */
@@ -543,6 +545,12 @@ CREATE TABLE vol_capfloor (
     (smile_type='ATM'    AND strike_rate IS NULL)
     OR
     (smile_type='STRIKE' AND strike_rate IS NOT NULL)
+  ),
+  CHECK (sabr_shift >= 0.0),
+  CHECK (
+    (quote_type='SLN_VOL' AND quote_shift IS NOT NULL AND quote_shift >= 0.0)
+    OR
+    (quote_type IN ('LN_VOL','N_VOL') AND quote_shift IS NULL)
   )
 );
 
@@ -552,7 +560,7 @@ ON vol_capfloor(
   snapshot_id, ccy,
   COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
   index_tenor, smile_type,
-  COALESCE(strike_rate,-1.0), quote_type
+  COALESCE(strike_rate,-1.0), quote_type, COALESCE(quote_shift,-1.0)
 );
 
 
@@ -561,6 +569,8 @@ CREATE TABLE vol_swaption (
   snapshot_id    TEXT NOT NULL REFERENCES market_snapshot(snapshot_id),
 
   ccy            TEXT NOT NULL REFERENCES currency(ccy),
+  ref_rate_id    TEXT NOT NULL REFERENCES ref_rate_rule(index_id),
+  index_tenor    TEXT NOT NULL,
 
   /* 満期（オプション満期）＋スワップ年限（基底スワップのテナー） */
   expiry_tenor   TEXT,
@@ -569,15 +579,31 @@ CREATE TABLE vol_swaption (
   x_years        REAL NOT NULL,                                   -- オプションの年率時間
   vol_daycount   TEXT NOT NULL REFERENCES daycount(code),
 
-  /* 方式：ATM 中心（標準）。必要なら将来 STRIKE 軸を追加する想定 */
-  quote_type     TEXT NOT NULL CHECK (quote_type IN ('LN_VOL','N_VOL')),
+  /* キューブ軸：ATM / STRIKE / MONEYNESS */
+  smile_type     TEXT NOT NULL CHECK (smile_type IN ('ATM','STRIKE','MONEYNESS')),
+  strike_rate    REAL,                                            -- smile_type='STRIKE' のとき必須
+  moneyness      REAL,                                            -- smile_type='MONEYNESS' のとき必須
+
+  /* vol_swaption は Shifted Black へ正規化済みボラを保持 */
+  quote_type     TEXT NOT NULL CHECK (quote_type IN ('SLN_VOL')),
+  quote_shift    REAL NOT NULL DEFAULT 0.0,                       -- 正規化後 Shifted Black のシフト
+  sabr_shift     REAL NOT NULL DEFAULT 0.0,                      -- Shifted SABR の絶対シフト量（例: 0.02）
   sigma          REAL NOT NULL,
 
   /* 監査メタ */
   quote_time_utc TEXT,
   source_symbol  TEXT,
   surface_tag    TEXT,
-  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (sabr_shift >= 0.0),
+  CHECK (quote_shift >= 0.0),
+  CHECK (
+    (smile_type='ATM'       AND strike_rate IS NULL AND moneyness IS NULL)
+    OR
+    (smile_type='STRIKE'    AND strike_rate IS NOT NULL AND moneyness IS NULL)
+    OR
+    (smile_type='MONEYNESS' AND strike_rate IS NULL AND moneyness IS NOT NULL)
+  )
 );
 
 
@@ -585,7 +611,11 @@ CREATE UNIQUE INDEX IF NOT EXISTS ux_vol_swaption_uq
 ON vol_swaption(
   snapshot_id, ccy,
   COALESCE(expiry_date,''), COALESCE(expiry_tenor,''),
-  swap_tenor, quote_type
+  ref_rate_id, index_tenor, swap_tenor,
+  smile_type,
+  COALESCE(strike_rate, -1.0e100),
+  COALESCE(moneyness, -1.0e100),
+  quote_type
 );
 
 /* 過去のFixing情報 */
@@ -620,8 +650,8 @@ CREATE TABLE IF NOT EXISTS market_quote_hdr (
   snapshot_id   TEXT NOT NULL REFERENCES market_snapshot(snapshot_id), -- 属するマーケットスナップショット
   batch_id      TEXT REFERENCES md_import_batch(batch_id),     -- 由来受信バッチ（任意）
   vendor_id     TEXT REFERENCES md_vendor(vendor_id),          -- 由来ベンダー（任意：batch_id から導出できる場合も）
-  quote_type    TEXT NOT NULL                                  -- クォート種別（v1: DEPOSIT/IR_FUTURES/SWAP/BOND）
-               CHECK(quote_type IN ('DEPOSIT','IR_FUTURES','SWAP','BOND')),
+  quote_type    TEXT NOT NULL                                  -- クォート種別（v1: DEPOSIT/IR_FUTURES/SWAP/BOND/CAPFLOOR/SWAPTION）
+               CHECK(quote_type IN ('DEPOSIT','IR_FUTURES','SWAP','BOND','CAPFLOOR','SWAPTION')),
 
   source_symbol TEXT,                                         -- ベンダー側ティッカー/ID（任意）
   recv_ts       TEXT,                                         -- 当該クォートの観測/受信UTC（任意：ティック時刻等）
@@ -750,6 +780,142 @@ CREATE TABLE IF NOT EXISTS market_quote_swap (
 CREATE INDEX IF NOT EXISTS ix_market_quote_swap_ccy_maturity
   ON market_quote_swap(ccy, maturity_tenor);
 
+-- ---------------------------------------------------------------------
+-- market_quote_capfloor
+--
+-- テーブル説明:
+--   Cap/Floor（Term Vol または Optionlet Vol）のクォート詳細。
+-- 使用目的:
+--   - term vol をストリップして vol_capfloor（optionlet vol）を生成する入力として使用する
+--   - 既に optionlet vol が配信される場合は、そのまま vol_capfloor へのロード元として使用する
+-- 備考:
+--   - smile_type='MONEYNESS' の場合は strike_rate を NULL、moneyness を必須とする
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_quote_capfloor (
+  quote_id        TEXT PRIMARY KEY
+                 REFERENCES market_quote_hdr(quote_id) ON DELETE CASCADE,
+
+  ccy             TEXT NOT NULL REFERENCES currency(ccy),
+  ref_rate_id     TEXT NOT NULL REFERENCES ref_rate_rule(index_id), -- 例: 'JPY-TONAR-3M','USD-SOFR-3M'
+  index_tenor     TEXT NOT NULL,                                    -- 例: '1M','3M','6M'
+  cp_flag         TEXT NOT NULL CHECK (cp_flag IN ('C','P')),       -- 'C'=Cap, 'P'=Floor
+
+  quote_kind      TEXT NOT NULL CHECK (quote_kind IN ('TERM_VOL','OPTIONLET_VOL')),
+
+  expiry_tenor    TEXT,                                              -- 例: '1Y','2Y'
+  expiry_date     TEXT,                                              -- 任意（実日付指定）
+  x_years         REAL NOT NULL CHECK (x_years > 0.0),               -- ボラ時間（年）
+  vol_daycount    TEXT NOT NULL DEFAULT 'ACT/365F' REFERENCES daycount(code),
+
+  smile_type      TEXT NOT NULL CHECK (smile_type IN ('ATM','STRIKE','MONEYNESS')),
+  strike_rate     REAL,                                              -- STRIKE のとき必須
+  moneyness       REAL,                                              -- MONEYNESS のとき必須（例: K-F の絶対値）
+
+  quote_type      TEXT NOT NULL CHECK (quote_type IN ('LN_VOL','N_VOL','SLN_VOL')),
+  quote_shift     REAL,                                              -- quote_type='SLN_VOL' のとき必須（絶対シフト）
+  sigma_mid       REAL NOT NULL,
+  sigma_bid       REAL,
+  sigma_ask       REAL,
+
+  -- TERM_VOL ストリップ時に使用する補助入力（任意）
+  annuity_factor  REAL,
+  forward_rate    REAL,
+
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK (
+    (smile_type='ATM'       AND strike_rate IS NULL AND moneyness IS NULL)
+    OR
+    (smile_type='STRIKE'    AND strike_rate IS NOT NULL AND moneyness IS NULL)
+    OR
+    (smile_type='MONEYNESS' AND strike_rate IS NULL AND moneyness IS NOT NULL)
+  ),
+  CHECK (
+    (sigma_bid IS NULL AND sigma_ask IS NULL)
+    OR
+    (sigma_bid <= sigma_ask)
+  ),
+  CHECK (
+    (quote_type='SLN_VOL' AND quote_shift IS NOT NULL AND quote_shift >= 0.0)
+    OR
+    (quote_type IN ('LN_VOL','N_VOL') AND quote_shift IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS ix_market_quote_capfloor_surface
+  ON market_quote_capfloor(
+    ccy, ref_rate_id, index_tenor, cp_flag, quote_kind, quote_type, x_years
+  );
+
+CREATE INDEX IF NOT EXISTS ix_market_quote_capfloor_expiry
+  ON market_quote_capfloor(expiry_date, expiry_tenor);
+
+-- ---------------------------------------------------------------------
+-- market_quote_swaption
+--
+-- テーブル説明:
+--   Swaption（主に European）のボラティリティクォート詳細。
+-- 使用目的:
+--   - quote_type=L/N/SLN の市場クォートを受け取り、
+--     Shifted Black 正規化後に vol_swaption へ投入する入力として使用する
+-- 備考:
+--   - smile_type='MONEYNESS' の場合は strike_rate を NULL、moneyness を必須とする
+-- ---------------------------------------------------------------------
+CREATE TABLE IF NOT EXISTS market_quote_swaption (
+  quote_id        TEXT PRIMARY KEY
+                 REFERENCES market_quote_hdr(quote_id) ON DELETE CASCADE,
+
+  ccy             TEXT NOT NULL REFERENCES currency(ccy),
+  ref_rate_id     TEXT NOT NULL REFERENCES ref_rate_rule(index_id), -- 例: 'USD-SOFR-3M'
+  index_tenor     TEXT NOT NULL,                                    -- 例: '3M'
+  cp_flag         TEXT NOT NULL CHECK (cp_flag IN ('C','P')),       -- 'C'=payer, 'P'=receiver
+
+  expiry_tenor    TEXT,                                              -- 例: '1Y','2Y'
+  expiry_date     TEXT,                                              -- 任意（実日付指定）
+  swap_tenor      TEXT NOT NULL,                                     -- 例: '5Y','10Y'
+  x_years         REAL NOT NULL CHECK (x_years > 0.0),               -- ボラ時間（年）
+  vol_daycount    TEXT NOT NULL DEFAULT 'ACT/365F' REFERENCES daycount(code),
+
+  smile_type      TEXT NOT NULL CHECK (smile_type IN ('ATM','STRIKE','MONEYNESS')),
+  strike_rate     REAL,                                              -- STRIKE のとき必須
+  moneyness       REAL,                                              -- MONEYNESS のとき必須（例: K-F）
+  forward_rate    REAL,                                              -- ATM/MONEYNESS の strike 解決に使用（任意）
+
+  quote_type      TEXT NOT NULL CHECK (quote_type IN ('LN_VOL','N_VOL','SLN_VOL')),
+  quote_shift     REAL,                                              -- quote_type='SLN_VOL' のとき必須（絶対シフト）
+  sigma_mid       REAL NOT NULL,
+  sigma_bid       REAL,
+  sigma_ask       REAL,
+
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK (
+    (smile_type='ATM'       AND strike_rate IS NULL AND moneyness IS NULL)
+    OR
+    (smile_type='STRIKE'    AND strike_rate IS NOT NULL AND moneyness IS NULL)
+    OR
+    (smile_type='MONEYNESS' AND strike_rate IS NULL AND moneyness IS NOT NULL)
+  ),
+  CHECK (
+    (sigma_bid IS NULL AND sigma_ask IS NULL)
+    OR
+    (sigma_bid <= sigma_ask)
+  ),
+  CHECK (
+    (quote_type='SLN_VOL' AND quote_shift IS NOT NULL AND quote_shift >= 0.0)
+    OR
+    (quote_type IN ('LN_VOL','N_VOL') AND quote_shift IS NULL)
+  )
+);
+
+CREATE INDEX IF NOT EXISTS ix_market_quote_swaption_surface
+  ON market_quote_swaption(
+    ccy, ref_rate_id, index_tenor, swap_tenor, quote_type, x_years
+  );
+
+CREATE INDEX IF NOT EXISTS ix_market_quote_swaption_expiry
+  ON market_quote_swaption(expiry_date, expiry_tenor);
+
 -- =========================================================
 -- BOND Quote
 --   共通ヘッダ: market_quote_hdr（snapshot_id / quote_type / qa_flag / use_in_build 等）
@@ -837,17 +1003,42 @@ CREATE TABLE IF NOT EXISTS curve_build_run (
    ========================= */
 CREATE TABLE model_param (
   snapshot_id TEXT NOT NULL REFERENCES market_snapshot(snapshot_id),
-  model_tag   TEXT NOT NULL,                                      -- 'BLACK','BACHELIER','BLACK_SHIFT','GK' 等
+  model_tag   TEXT NOT NULL,                                      -- 'BLACK','BACHELIER','BLACK_SHIFT','SABR_SHIFTED','GK' 等
   scope       TEXT NOT NULL,                                      -- 'CCY','PAIR','INDEX','GLOBAL'
   param_key   TEXT NOT NULL,                                      -- 'JPY','USDJPY','JPY-TONAR' 等
-  param_name  TEXT NOT NULL,                                      -- 'shift','beta','rho' 等
+  expiry_tenor TEXT,                                              -- 満期軸（例: '1Y','2Y'）
+  expiry_date TEXT,                                                -- 満期実日付（任意）
+  x_years    REAL,                                                 -- 満期を年率時間で保持（任意）
+  swap_tenor TEXT,                                                 -- Swaption の基底スワップ年限（例: '5Y','10Y'）
+  strike_rate REAL,                                                -- ストライク軸（任意）
+  moneyness  REAL,                                                 -- マネーネス軸（任意。例: strike-forward）
+  param_name  TEXT NOT NULL,                                      -- 'shift','alpha','beta','rho','nu' 等
   param_val   REAL NOT NULL,
   param_unit  TEXT,                                               -- 'abs','bp','ratio' 等（任意）
   source_symbol TEXT,                                             -- ベンダ/由来
   note        TEXT,
   created_at TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
-  PRIMARY KEY (snapshot_id, model_tag, scope, param_key, param_name)
+  CHECK (x_years IS NULL OR x_years >= 0.0),
+  CHECK (strike_rate IS NULL OR moneyness IS NULL)
 );
+
+CREATE UNIQUE INDEX IF NOT EXISTS ux_model_param_uq
+ON model_param(
+  snapshot_id,
+  model_tag,
+  scope,
+  param_key,
+  COALESCE(expiry_tenor, ''),
+  COALESCE(expiry_date, ''),
+  COALESCE(x_years, -1.0),
+  COALESCE(swap_tenor, ''),
+  COALESCE(strike_rate, -1.0e100),
+  COALESCE(moneyness, -1.0e100),
+  param_name
+);
+
+CREATE INDEX IF NOT EXISTS ix_model_param_lookup
+  ON model_param(snapshot_id, model_tag, scope, param_key, param_name);
 
 
 /* =========================
@@ -1056,13 +1247,15 @@ CREATE TABLE IF NOT EXISTS trade_fxfwd (
   trade_id        TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
   base_ccy        TEXT NOT NULL REFERENCES currency(ccy),
   quote_ccy       TEXT NOT NULL REFERENCES currency(ccy),
+  notional_ccy    TEXT REFERENCES currency(ccy),   -- trade.notional の通貨（NULLは base_ccy とみなす）
   pair            TEXT NOT NULL,
   deliver_date    TEXT NOT NULL,
   forward_rate    REAL NOT NULL,
   settle_bdc      TEXT NOT NULL REFERENCES bizday_convention(code),
   deliver_cal_id  TEXT NOT NULL REFERENCES calendar_def(cal_id),
   pay_rec_base    TEXT NOT NULL CHECK (pay_rec_base IN ('PAY','REC')),
-  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (notional_ccy IS NULL OR notional_ccy IN (base_ccy, quote_ccy))
 );
 
 
@@ -1138,6 +1331,11 @@ CREATE TABLE IF NOT EXISTS trade_swaption (
   exercise_close    TEXT,                                            -- AM：行使終了（=expiry_date など）
 
   settlement        TEXT NOT NULL CHECK (settlement IN ('PHYS','CASH')),
+  cash_settle_method TEXT
+                    CHECK (cash_settle_method IN ('PAR_YIELD_ANN','DISCOUNTED_SWAP_PV')),
+  cash_settle_lag_bd INTEGER,
+  cash_settle_bdc    TEXT REFERENCES bizday_convention(code),
+  cash_settle_cal_id TEXT REFERENCES calendar_def(cal_id),
 
   /* 基底スワップ規約（固定レグ） */
   swap_pay_rec      TEXT NOT NULL CHECK (swap_pay_rec IN ('PAY','REC')),
@@ -1156,6 +1354,8 @@ CREATE TABLE IF NOT EXISTS trade_swaption (
   swap_float_bdc    TEXT NOT NULL REFERENCES bizday_convention(code),
   swap_float_cal    TEXT NOT NULL REFERENCES calendar_def(cal_id),
 
+  swap_start_date   TEXT,                                            -- NULL の場合は expiry_date を起点
+  swap_spot_lag_bd  INTEGER NOT NULL DEFAULT 0,
   swap_maturity     TEXT NOT NULL,
   created_at      TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
 
@@ -1166,7 +1366,20 @@ CREATE TABLE IF NOT EXISTS trade_swaption (
     (option_style='AMERICAN' AND exercise_open IS NOT NULL AND exercise_close IS NOT NULL)
     OR
     (option_style='BERMUDAN' AND exercise_open IS NULL AND exercise_close IS NULL)
-  )
+  ),
+  CHECK (swap_maturity > expiry_date),
+  CHECK (
+    (settlement='PHYS' AND cash_settle_method IS NULL AND cash_settle_lag_bd IS NULL AND cash_settle_bdc IS NULL AND cash_settle_cal_id IS NULL)
+    OR
+    (settlement='CASH' AND cash_settle_method IS NOT NULL)
+  ),
+  CHECK (
+    (cp_flag='C' AND swap_pay_rec='PAY')
+    OR
+    (cp_flag='P' AND swap_pay_rec='REC')
+  ),
+  CHECK (cash_settle_lag_bd IS NULL OR cash_settle_lag_bd >= 0),
+  CHECK (swap_spot_lag_bd >= 0)
 );
 CREATE INDEX IF NOT EXISTS idx_swaption_expiry ON trade_swaption(expiry_date);
 
@@ -1187,14 +1400,34 @@ CREATE INDEX IF NOT EXISTS idx_swaption_berm_date
 CREATE TABLE IF NOT EXISTS trade_ir_futures (
   trade_id           TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
   fut_code           TEXT NOT NULL REFERENCES ir_futures_def(fut_code),
-  contract_month     TEXT NOT NULL,                          -- 'YYYY-MM'（限月）
+  contract_month     TEXT NOT NULL,                          -- 'YYYYMM'（限月）
   last_trading_date  TEXT,                                   -- 明示指定（NULLは規約から導出）
   position_lots      INTEGER NOT NULL,                       -- 枚数（ロング>0/ショート<0）
   price_agreed       REAL NOT NULL,                          -- 約定時の先物価格（PRICE or RATE；quote_conv参照）
   margin_style       TEXT NOT NULL CHECK (margin_style IN ('EXCHANGE','BILATERAL')),
+  ref_rate_id        TEXT REFERENCES ref_rate_rule(index_id),-- 参照金利（NULL時は ir_futures_def.underlying_ref_rate_id）
+  accrual_start_date TEXT NOT NULL,                          -- 金利計算期間開始日
+  accrual_end_date   TEXT NOT NULL,                          -- 金利計算期間終了日
+  accrual_daycount   TEXT REFERENCES daycount(code),         -- 金利計算期間の日数計算（NULL時は ref_rate_rule.daycount）
+  convexity_model    TEXT NOT NULL DEFAULT 'NONE'
+                     CHECK (convexity_model IN ('NONE','ADDITIVE','HW1F')),
+  convexity_adj_rate REAL NOT NULL DEFAULT 0.0,              -- 加算型コンベクシティ調整（年率・実数）
+  hw_mean_reversion  REAL,                                   -- HW1F: 平均回帰 a
+  hw_vol             REAL,                                   -- HW1F: ボラティリティ sigma
   cal_id_override    TEXT REFERENCES calendar_def(cal_id),   -- 取引所カレンダー明示（通常NULL）
-  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now'))
+  created_at         TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  CHECK (accrual_end_date > accrual_start_date),
+  CHECK (
+    (convexity_model = 'HW1F' AND hw_mean_reversion IS NOT NULL AND hw_vol IS NOT NULL)
+    OR
+    (convexity_model IN ('NONE','ADDITIVE') AND hw_mean_reversion IS NULL AND hw_vol IS NULL)
+  ),
+  CHECK (hw_mean_reversion IS NULL OR hw_mean_reversion >= 0.0),
+  CHECK (hw_vol IS NULL OR hw_vol >= 0.0)
 );
+
+CREATE INDEX IF NOT EXISTS idx_trade_ir_futures_ref_period
+  ON trade_ir_futures(ref_rate_id, accrual_start_date, accrual_end_date);
 
 CREATE TABLE IF NOT EXISTS trade_fra (
   trade_id           TEXT PRIMARY KEY REFERENCES trade(trade_id) ON DELETE CASCADE,
@@ -1342,6 +1575,63 @@ CREATE INDEX IF NOT EXISTS idx_bond_schedule_base_security_payment
 
 CREATE INDEX IF NOT EXISTS idx_bond_schedule_trade_id
   ON bond_schedule(trade_id);
+
+CREATE TABLE IF NOT EXISTS schedule_capfloor (
+  trade_id         TEXT NOT NULL REFERENCES trade(trade_id) ON DELETE CASCADE,
+  cashflow_no      INTEGER NOT NULL,
+  payment_date     TEXT NOT NULL,
+  ccy              TEXT NOT NULL REFERENCES currency(ccy),
+
+  cp_flag          TEXT NOT NULL CHECK (cp_flag IN ('C','P')), -- 'C'=Cap, 'P'=Floor
+  pay_rec          TEXT NOT NULL CHECK (pay_rec IN ('PAY','REC')),
+
+  start_date       TEXT NOT NULL,
+  end_date         TEXT NOT NULL,
+  daycount         TEXT NOT NULL REFERENCES daycount(code),
+  accrual_factor   REAL NOT NULL,
+  notional         REAL NOT NULL,
+  strike_rate      REAL NOT NULL,
+
+  index_id         TEXT NOT NULL REFERENCES ref_rate_rule(index_id),
+  rate_calc_type   TEXT NOT NULL CHECK (
+                     rate_calc_type IN ('IBOR_SINGLE','OIS_COMPOUNDED','OIS_AVERAGED','MANUAL')
+                   ),
+  fixing_date      TEXT,
+  obs_start_date   TEXT,
+  obs_end_date     TEXT,
+
+  observed_rate    REAL,                     -- 過去期間の実績Fixing（確定後）
+  forward_rate     REAL,                     -- 将来期間の予測フォワード（任意保持）
+  payoff_rate      REAL,                     -- max(L-K,0) or max(K-L,0)
+  amount           REAL,                     -- オプションレット金額（符号なし）
+  fixed_amount     REAL,                     -- 確定後の金額（符号なし）
+  is_fixed         INTEGER NOT NULL DEFAULT 0 CHECK (is_fixed IN (0,1)),
+
+  is_settled       INTEGER NOT NULL DEFAULT 0 CHECK (is_settled IN (0,1)),
+  settled_amount   REAL,
+  settled_date     TEXT,
+  settlement_ref   TEXT,
+
+  updated_at       TEXT,
+  created_at       TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK (
+    fixing_date IS NOT NULL
+    OR
+    (obs_start_date IS NOT NULL AND obs_end_date IS NOT NULL)
+  ),
+
+  PRIMARY KEY (trade_id, cashflow_no)
+);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_capfloor_trade_payment
+  ON schedule_capfloor(trade_id, payment_date);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_capfloor_index_fixing
+  ON schedule_capfloor(index_id, fixing_date);
+
+CREATE INDEX IF NOT EXISTS idx_schedule_capfloor_unsettled_date
+  ON schedule_capfloor(is_settled, payment_date);
 
 
 CREATE TABLE IF NOT EXISTS measure_def (
@@ -1664,6 +1954,38 @@ CREATE TABLE IF NOT EXISTS pricing_profile_map (
 
   PRIMARY KEY (profile_id, product, ccy, md_role)
 );
+
+/* プロファイル別モデル設定
+   - profile_id + product + scope + scope_key で一意
+   - scope='GLOBAL' は scope_key='GLOBAL'、scope='CCY' は通貨コード（例: 'USD'）
+   - pricing_model: PV計算モデル（例: SHIFTED_BLACK / BACHELIER）
+   - vol_interp_model: ボラ補間モデル（例: SHIFTED_SABR）
+*/
+CREATE TABLE IF NOT EXISTS pricing_model (
+  profile_id        TEXT NOT NULL REFERENCES pricing_profile(profile_id),
+  product           TEXT NOT NULL REFERENCES m_trade_product(product),
+  scope             TEXT NOT NULL CHECK (scope IN ('GLOBAL','CCY')),
+  scope_key         TEXT NOT NULL,
+
+  pricing_model     TEXT NOT NULL,                                -- 商品PV計算モデル
+  vol_interp_model  TEXT,                                         -- ボラ補間モデル（必要な商品のみ）
+  model_tag         TEXT,                                         -- model_param を引くタグ
+  vol_quote_type    TEXT,                                         -- 参照するボラクォート種別
+  surface_tag       TEXT,                                         -- 参照する面タグ（任意）
+
+  note              TEXT,
+  created_at        TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+
+  CHECK (
+    (scope='GLOBAL' AND scope_key='GLOBAL')
+    OR
+    (scope='CCY' AND length(scope_key) > 0)
+  ),
+  PRIMARY KEY (profile_id, product, scope, scope_key)
+);
+
+CREATE INDEX IF NOT EXISTS ix_pricing_model_lookup
+  ON pricing_model(profile_id, product, scope, scope_key);
 
 /* =========================
    シナリオ

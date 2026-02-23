@@ -76,114 +76,6 @@ def _year_fractions_from_dates(
     return np.array([year_fraction(base, d, daycount) for d in dates], dtype=float)
 
 
-def _resolve_accrual_factor(row: SwapScheduleRow) -> float:
-    if row.accrual_factor is not None:
-        return float(row.accrual_factor)
-    if row.start_date is None or row.end_date is None or row.daycount is None:
-        raise ValueError("swap_schedule missing start/end/daycount for accrual.")
-    return float(year_fraction(row.start_date, row.end_date, row.daycount))
-
-
-def _resolve_notional(row: SwapScheduleRow, trade: TradeHeader) -> float:
-    return float(row.notional) if row.notional is not None else float(trade.notional)
-
-
-def _apply_spread_gearing(base_rate: float, row: SwapScheduleRow) -> float:
-    spread = float(row.spread) if row.spread is not None else 0.0
-    gearing = float(row.gearing) if row.gearing is not None else 1.0
-    return base_rate * gearing + spread
-
-
-def _resolve_base_rate_from_fixing(
-    row: SwapScheduleRow,
-    fixing_map: dict[tuple[str, date], float],
-    *,
-    as_of: date,
-) -> Optional[float]:
-    if row.fixing_date is None or row.index_id is None:
-        return None
-    if row.fixing_date > as_of:
-        return None
-    return fixing_map.get((row.index_id, row.fixing_date))
-
-
-def _resolve_base_rate_from_curve(
-    row: SwapScheduleRow,
-    *,
-    forward_curve: YieldCurve,
-    as_of: date,
-    forward_daycount: str,
-    compounding: Compounding | str,
-) -> float:
-    if row.start_date is None or row.end_date is None:
-        raise ValueError("swap_schedule missing start/end date for float rate.")
-    t_start = year_fraction(as_of, row.start_date, forward_daycount)
-    t_end = year_fraction(as_of, row.end_date, forward_daycount)
-    df_start = float(np.asarray(forward_curve.df(t_start)))
-    df_end = float(np.asarray(forward_curve.df(t_end)))
-    accrual = _resolve_accrual_factor(row)
-    return float(forward_rate_from_dfs(df_start, df_end, accrual, compounding))
-
-
-def _resolve_rate(
-    row: SwapScheduleRow,
-    *,
-    forward_curve: YieldCurve,
-    as_of: date,
-    forward_daycount: str,
-    compounding: Compounding | str,
-    fixing_map: dict[tuple[str, date], float],
-) -> float:
-    if row.rate is not None:
-        return float(row.rate)
-    if row.rate_calc_type == "FIXED":
-        raise ValueError("swap_schedule missing fixed rate for FIXED leg.")
-    base = _resolve_base_rate_from_fixing(row, fixing_map, as_of=as_of)
-    if base is None:
-        base = _resolve_base_rate_from_curve(
-            row,
-            forward_curve=forward_curve,
-            as_of=as_of,
-            forward_daycount=forward_daycount,
-            compounding=compounding,
-        )
-    return _apply_spread_gearing(base, row)
-
-
-def _resolve_cashflow_amount(
-    row: SwapScheduleRow,
-    *,
-    trade: TradeHeader,
-    forward_curve: YieldCurve,
-    as_of: date,
-    forward_daycount: str,
-    compounding: Compounding | str,
-    fixing_map: dict[tuple[str, date], float],
-) -> float:
-    if row.fixed_amount is not None:
-        return float(row.fixed_amount)
-    if row.amount is not None:
-        return float(row.amount)
-    if row.payment_type == "FEE":
-        raise ValueError("swap_schedule missing amount for FEE cashflow.")
-    if row.payment_type == "PRINCIPAL":
-        notional = _resolve_notional(row, trade)
-        if row.principal_factor is None:
-            raise ValueError("swap_schedule missing principal_factor for principal cashflow.")
-        return notional * float(row.principal_factor)
-    accrual = _resolve_accrual_factor(row)
-    rate = _resolve_rate(
-        row,
-        forward_curve=forward_curve,
-        as_of=as_of,
-        forward_daycount=forward_daycount,
-        compounding=compounding,
-        fixing_map=fixing_map,
-    )
-    notional = _resolve_notional(row, trade)
-    return notional * rate * accrual
-
-
 def price_swap_from_data(data: SwapPricingData) -> SwapPVResult:
     fixing_map = {(f.index_id, f.fixing_date): f.rate for f in data.fixings}
     rows = data.schedule_rows
@@ -195,36 +87,151 @@ def price_swap_from_data(data: SwapPricingData) -> SwapPVResult:
     forward_daycount = data.pricing.forward_daycount
     compounding = data.pricing.float_compounding
 
-    pv_fixed = 0.0
-    pv_float = 0.0
-    pv_other = 0.0
+    active_rows = [
+        row
+        for row in rows
+        if (data.pricing.include_settled or row.is_settled != 1) and row.payment_date > as_of
+    ]
+    if not active_rows:
+        return SwapPVResult(pv=0.0, pv_fixed=0.0, pv_float=0.0)
 
-    for row in rows:
-        if not data.pricing.include_settled and row.is_settled == 1:
-            continue
-        if row.payment_date <= as_of:
-            continue
-        amount = _resolve_cashflow_amount(
-            row,
-            trade=data.trade,
-            forward_curve=data.forward_curve,
-            as_of=as_of,
-            forward_daycount=forward_daycount,
-            compounding=compounding,
-            fixing_map=fixing_map,
+    pay_dates = [row.payment_date for row in active_rows]
+    leg_arr = np.asarray([row.leg_id for row in active_rows], dtype="U8")
+    pay_rec_arr = np.asarray([row.pay_rec.upper() for row in active_rows], dtype="U4")
+    payment_type_arr = np.asarray([row.payment_type for row in active_rows], dtype="U10")
+    rate_calc_type_arr = np.asarray(
+        [row.rate_calc_type if row.rate_calc_type is not None else "" for row in active_rows],
+        dtype="U20",
+    )
+    sign_arr = np.where(pay_rec_arr == "REC", 1.0, -1.0)
+
+    notional_arr = np.asarray(
+        [np.nan if row.notional is None else float(row.notional) for row in active_rows], dtype=float
+    )
+    needs_notional_mask = payment_type_arr != "FEE"
+    if np.any(np.isnan(notional_arr[needs_notional_mask])):
+        raise ValueError(
+            "swap_schedule.notional is required for INTEREST/PRINCIPAL rows to support amortization."
         )
-        t_pay = year_fraction(as_of, row.payment_date, discount_daycount)
-        df = float(np.asarray(data.discount_curve.df(t_pay)))
-        sign = 1.0 if row.pay_rec.upper() == "REC" else -1.0
-        pv = sign * amount * df
-        if row.leg_id == "FIXED":
-            pv_fixed += pv
-        elif row.leg_id == "FLOAT":
-            pv_float += pv
-        else:
-            pv_other += pv
 
-    total = pv_fixed + pv_float + pv_other
+    fixed_amount_arr = np.asarray(
+        [np.nan if row.fixed_amount is None else float(row.fixed_amount) for row in active_rows],
+        dtype=float,
+    )
+    amount_arr = np.asarray(
+        [np.nan if row.amount is None else float(row.amount) for row in active_rows],
+        dtype=float,
+    )
+    amount_arr = np.where(np.isnan(fixed_amount_arr), amount_arr, fixed_amount_arr)
+
+    needs_calc = np.isnan(amount_arr)
+    fee_mask = needs_calc & (payment_type_arr == "FEE")
+    if np.any(fee_mask):
+        raise ValueError("swap_schedule missing amount for FEE cashflow.")
+
+    principal_mask = needs_calc & (payment_type_arr == "PRINCIPAL")
+    if np.any(principal_mask):
+        principal_factor_arr = np.asarray(
+            [
+                np.nan if row.principal_factor is None else float(row.principal_factor)
+                for row in active_rows
+            ],
+            dtype=float,
+        )
+        if np.any(np.isnan(principal_factor_arr[principal_mask])):
+            raise ValueError("swap_schedule missing principal_factor for principal cashflow.")
+        amount_arr[principal_mask] = notional_arr[principal_mask] * principal_factor_arr[principal_mask]
+
+    interest_mask = needs_calc & (payment_type_arr == "INTEREST")
+    if np.any(interest_mask):
+        accrual_arr = np.asarray(
+            [
+                float(row.accrual_factor)
+                if row.accrual_factor is not None
+                else (
+                    float(year_fraction(row.start_date, row.end_date, row.daycount))
+                    if (row.start_date is not None and row.end_date is not None and row.daycount is not None)
+                    else np.nan
+                )
+                for row in active_rows
+            ],
+            dtype=float,
+        )
+        if np.any(np.isnan(accrual_arr[interest_mask])):
+            raise ValueError("swap_schedule missing start/end/daycount for accrual.")
+
+        rate_arr = np.asarray(
+            [np.nan if row.rate is None else float(row.rate) for row in active_rows], dtype=float
+        )
+        unresolved_rate_mask = interest_mask & np.isnan(rate_arr)
+        fixed_unresolved = unresolved_rate_mask & (rate_calc_type_arr == "FIXED")
+        if np.any(fixed_unresolved):
+            raise ValueError("swap_schedule missing fixed rate for FIXED leg.")
+
+        float_mask = unresolved_rate_mask & (rate_calc_type_arr != "FIXED")
+        if np.any(float_mask):
+            row_idx = np.where(float_mask)[0]
+            fix_rate_arr = np.full(row_idx.size, np.nan, dtype=float)
+            for i, idx in enumerate(row_idx):
+                row = active_rows[int(idx)]
+                if row.fixing_date is None or row.index_id is None or row.fixing_date > as_of:
+                    continue
+                key = (row.index_id, row.fixing_date)
+                if key in fixing_map:
+                    fix_rate_arr[i] = float(fixing_map[key])
+
+            use_curve = np.isnan(fix_rate_arr)
+            if np.any(use_curve):
+                curve_idx = row_idx[use_curve]
+                obs_start_dates: list[date] = []
+                obs_end_dates: list[date] = []
+                for idx in curve_idx:
+                    row = active_rows[int(idx)]
+                    obs_start = row.obs_start_date if row.obs_start_date is not None else row.start_date
+                    obs_end = row.obs_end_date if row.obs_end_date is not None else row.end_date
+                    if obs_start is None or obs_end is None:
+                        raise ValueError("swap_schedule missing observation/accrual dates for float rate.")
+                    obs_start_dates.append(obs_start)
+                    obs_end_dates.append(obs_end)
+                t_start = _year_fractions_from_dates(as_of, obs_start_dates, forward_daycount)
+                t_end = _year_fractions_from_dates(as_of, obs_end_dates, forward_daycount)
+                df_start = np.asarray(data.forward_curve.df(t_start), dtype=float)
+                df_end = np.asarray(data.forward_curve.df(t_end), dtype=float)
+                fwd_accrual = np.array(
+                    [
+                        year_fraction(obs_start_dates[i], obs_end_dates[i], forward_daycount)
+                        for i in range(len(obs_start_dates))
+                    ],
+                    dtype=float,
+                )
+                fwd_rates = np.asarray(
+                    forward_rate_from_dfs(df_start, df_end, fwd_accrual, compounding), dtype=float
+                )
+                fix_rate_arr[use_curve] = fwd_rates
+
+            spread_arr = np.asarray(
+                [0.0 if active_rows[int(idx)].spread is None else float(active_rows[int(idx)].spread) for idx in row_idx],
+                dtype=float,
+            )
+            gearing_arr = np.asarray(
+                [1.0 if active_rows[int(idx)].gearing is None else float(active_rows[int(idx)].gearing) for idx in row_idx],
+                dtype=float,
+            )
+            rate_arr[row_idx] = fix_rate_arr * gearing_arr + spread_arr
+
+        amount_arr[interest_mask] = (
+            notional_arr[interest_mask] * rate_arr[interest_mask] * accrual_arr[interest_mask]
+        )
+
+    if np.any(np.isnan(amount_arr)):
+        raise ValueError("swap_schedule contains unresolved cashflow amount.")
+
+    t_pay = _year_fractions_from_dates(as_of, pay_dates, discount_daycount)
+    df_arr = np.asarray(data.discount_curve.df(t_pay), dtype=float)
+    pv_components = amount_arr * sign_arr * df_arr
+    pv_fixed = float(np.sum(pv_components[leg_arr == "FIXED"]))
+    pv_float = float(np.sum(pv_components[leg_arr == "FLOAT"]))
+    total = float(np.sum(pv_components))
     return SwapPVResult(pv=total, pv_fixed=pv_fixed, pv_float=pv_float)
 
 

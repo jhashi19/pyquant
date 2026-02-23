@@ -38,6 +38,7 @@ class TradeFxFwd:
     settle_bdc: str
     deliver_cal_id: str
     pay_rec_base: str
+    notional_ccy: Optional[str] = None
 
 
 @dataclass(frozen=True)
@@ -65,6 +66,11 @@ class FxForwardPricingData:
 @dataclass(frozen=True)
 class FxForwardPVResult:
     pv_quote: float
+    quote_ccy: str
+    pv_base: float
+    base_ccy: str
+    pv_reporting: float
+    reporting_ccy: str
     forward_mark: float
     forward_agreed: float
     spot: float
@@ -97,6 +103,59 @@ def _resolve_spot(spot: FxSpot, side: str) -> float:
     raise ValueError(f"Unsupported input_side: {side!r}")
 
 
+def _resolve_pay_rec_sign(pay_rec_base: str) -> float:
+    match pay_rec_base.upper():
+        case "REC":
+            return 1.0
+        case "PAY":
+            return -1.0
+        case _:
+            raise ValueError("trade_fxfwd.pay_rec_base must be 'PAY' or 'REC'.")
+
+
+def _resolve_base_notional(trade: TradeHeader, fwd: TradeFxFwd) -> float:
+    base_ccy = fwd.base_ccy.upper()
+    quote_ccy = fwd.quote_ccy.upper()
+    notional_ccy = (fwd.notional_ccy or base_ccy).upper()
+    notional = float(trade.notional)
+
+    match notional_ccy:
+        case _ if notional_ccy == base_ccy:
+            return notional
+        case _ if notional_ccy == quote_ccy:
+            if fwd.forward_rate <= 0.0:
+                raise ValueError("trade_fxfwd.forward_rate must be positive for quote-notional input.")
+            return notional / float(fwd.forward_rate)
+        case _:
+            raise ValueError(
+                "trade_fxfwd.notional_ccy must match either base_ccy or quote_ccy."
+            )
+
+
+def _resolve_reporting_pv_from_quote(
+    pv_quote: float,
+    *,
+    trade_ccy: str,
+    base_ccy: str,
+    quote_ccy: str,
+    spot: float,
+) -> float:
+    trade_ccy_u = trade_ccy.upper()
+    base_ccy_u = base_ccy.upper()
+    quote_ccy_u = quote_ccy.upper()
+    match trade_ccy_u:
+        case _ if trade_ccy_u == quote_ccy_u:
+            return float(pv_quote)
+        case _ if trade_ccy_u == base_ccy_u:
+            if spot == 0.0:
+                raise ValueError("spot must be non-zero to convert quote PV into base currency.")
+            return float(pv_quote / spot)
+        case _:
+            raise ValueError(
+                "trade.ccy must match base_ccy or quote_ccy for fx_forward reporting PV."
+            )
+
+
 def price_fx_forward_from_data(data: FxForwardPricingData) -> FxForwardPVResult:
     trade = data.trade
     fwd = data.trade_fxfwd
@@ -105,16 +164,32 @@ def price_fx_forward_from_data(data: FxForwardPricingData) -> FxForwardPVResult:
     if data.spot.pair != fwd.pair:
         raise ValueError("fx_spot.pair must match trade_fxfwd.pair.")
 
+    spot = _resolve_spot(data.spot, data.pricing.input_side)
+    sign = _resolve_pay_rec_sign(fwd.pay_rec_base)
+    base_notional = _resolve_base_notional(trade, fwd)
+
     as_of = data.as_of
     if fwd.deliver_date <= as_of:
+        pv_quote = 0.0
+        pv_base = 0.0
+        pv_reporting = _resolve_reporting_pv_from_quote(
+            pv_quote,
+            trade_ccy=trade.ccy,
+            base_ccy=fwd.base_ccy,
+            quote_ccy=fwd.quote_ccy,
+            spot=spot,
+        )
         return FxForwardPVResult(
-            pv_quote=0.0,
+            pv_quote=pv_quote,
+            quote_ccy=fwd.quote_ccy,
+            pv_base=pv_base,
+            base_ccy=fwd.base_ccy,
+            pv_reporting=pv_reporting,
+            reporting_ccy=trade.ccy,
             forward_mark=fwd.forward_rate,
             forward_agreed=fwd.forward_rate,
-            spot=_resolve_spot(data.spot, data.pricing.input_side),
+            spot=spot,
         )
-
-    spot = _resolve_spot(data.spot, data.pricing.input_side)
 
     t_base = year_fraction(as_of, fwd.deliver_date, data.pricing.base_curve_daycount)
     t_quote = year_fraction(as_of, fwd.deliver_date, data.pricing.quote_curve_daycount)
@@ -123,11 +198,25 @@ def price_fx_forward_from_data(data: FxForwardPricingData) -> FxForwardPVResult:
 
     forward_mark = spot * df_base / df_quote
     forward_agreed = fwd.forward_rate
-    sign = 1.0 if fwd.pay_rec_base.upper() == "REC" else -1.0
-    pv_quote = sign * float(trade.notional) * (forward_mark - forward_agreed) * df_quote
+    pv_quote = sign * base_notional * (forward_mark - forward_agreed) * df_quote
+    if spot == 0.0:
+        raise ValueError("spot must be non-zero for FX forward base-currency PV conversion.")
+    pv_base = pv_quote / spot
+    pv_reporting = _resolve_reporting_pv_from_quote(
+        pv_quote,
+        trade_ccy=trade.ccy,
+        base_ccy=fwd.base_ccy,
+        quote_ccy=fwd.quote_ccy,
+        spot=spot,
+    )
 
     return FxForwardPVResult(
         pv_quote=pv_quote,
+        quote_ccy=fwd.quote_ccy,
+        pv_base=float(pv_base),
+        base_ccy=fwd.base_ccy,
+        pv_reporting=pv_reporting,
+        reporting_ccy=trade.ccy,
         forward_mark=float(forward_mark),
         forward_agreed=float(forward_agreed),
         spot=float(spot),

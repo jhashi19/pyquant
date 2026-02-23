@@ -189,6 +189,7 @@ def price_fra_from_data(data: FRAPricingData) -> FRAPVResult:
     accrual_factor = year_fraction(fra.accrual_start_date, fra.accrual_end_date, fra.daycount)
 
     # Cash-settled FRA market convention: settle at accrual start with discounting by realized/proj floating rate.
+    # Note: If supporting 'Settle at Maturity', the formula would be simply: notional * accrual * diff
     diff = floating_rate - agreed_rate
     sign = 1.0 if fra.pay_rec.upper() == "PAY" else -1.0
     settlement_amount = sign * fra.notional * accrual_factor * diff / (
