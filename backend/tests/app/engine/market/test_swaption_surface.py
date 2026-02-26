@@ -3,7 +3,7 @@ from datetime import date
 import numpy as np
 
 from app.engine.market.sabr import SabrParams, SabrVolType, sabr_implied_vol
-from app.engine.market.swaption_surface import (
+from app.engine.market.swaption_cube import (
     MarketQuoteSwaption,
     VolSwaptionRowPayload,
     build_vol_swaption_rows_from_market_quotes,

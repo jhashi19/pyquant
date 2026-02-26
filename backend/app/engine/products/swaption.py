@@ -3,12 +3,12 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from datetime import date
 from enum import Enum
-from typing import Iterable, Optional, Protocol, Sequence
+from typing import Iterable, MutableMapping, Optional, Protocol, Sequence
 
 import numpy as np
 from scipy.special import ndtr  # type: ignore[import-untyped]
 
-from app.engine.market.sabr import SabrParams, SabrVolType, sabr_implied_vol
+from app.engine.market.sabr import SabrVolType, sabr_implied_vol
 from app.engine.market.yield_curve import YieldCurve
 from app.engine.math.bizday import BusinessCalendar, add_business_days, adjust_business_day
 from app.engine.math.daycount import year_fraction
@@ -16,6 +16,7 @@ from app.engine.math.rate_conversion import Compounding, forward_rate_from_dfs
 from app.engine.products.models.schedule_models import (
     CashflowPeriod,
     ModelParamRow,
+    SabrInterpolationSpec,
     TradeHeader,
     TradeSwaption,
 )
@@ -23,12 +24,14 @@ from app.engine.products.pricing_model import (
     PricingModelConfig,
     resolve_pricing_model_config,
 )
+from app.engine.products.sabr_interpolation import SwaptionAtmSabrInterpolator
 from app.engine.products.schedule_utils import (
     LegScheduleSpec,
-    add_tenor,
     build_leg_schedule,
     parse_tenor,
 )
+
+_VOL_FLOOR = 1e-10
 
 
 class SwaptionPricingModel(Enum):
@@ -93,6 +96,8 @@ class SwaptionPricingData:
     forward_curve: YieldCurve
     vol_points: tuple[VolSwaptionPoint, ...]
     model_param_rows: tuple[ModelParamRow, ...]
+    sabr_interpolation_spec: SabrInterpolationSpec
+    sabr_interpolator: SwaptionAtmSabrInterpolator
     pricing: SwaptionPricingInput
     as_of: date
     fixed_calendar: BusinessCalendar
@@ -148,49 +153,12 @@ class SwaptionDataProvider(Protocol):
         product: str,
     ) -> Sequence[PricingModelConfig]: ...
 
-
-@dataclass(frozen=True)
-class _ParamNode:
-    expiry_years: float
-    swap_years: float
-    value: float
-
-
-@dataclass(frozen=True)
-class _Interp2DCache:
-    y_axis: np.ndarray
-    x_axes: tuple[np.ndarray, ...]
-    v_axes: tuple[np.ndarray, ...]
-
-    def evaluate(self, *, expiry: float, swap_years: float) -> float:
-        xq = _round_years(expiry)
-        yq = _round_years(swap_years)
-        x_values_by_y = np.empty(self.y_axis.size, dtype=float)
-        for i in range(self.y_axis.size):
-            xs = self.x_axes[i]
-            vs = self.v_axes[i]
-            x_values_by_y[i] = float(np.interp(xq, xs, vs, left=vs[0], right=vs[-1]))
-        return float(
-            np.interp(
-                yq,
-                self.y_axis,
-                x_values_by_y,
-                left=x_values_by_y[0],
-                right=x_values_by_y[-1],
-            )
-        )
-
-
-def _scope_rank(scope: str) -> int:
-    key = scope.upper()
-    if key == "GLOBAL":
-        return 0
-    if key == "CCY":
-        return 1
-    if key == "INDEX":
-        return 2
-    return -1
-
+    def get_sabr_interpolation_spec(
+        self,
+        *,
+        product: str,
+        model_tag: str,
+    ) -> SabrInterpolationSpec: ...
 
 def _normalize_pricing_model(value: str) -> SwaptionPricingModel:
     key = value.strip().upper()
@@ -478,52 +446,74 @@ def _build_vol_shift_surface(vol_points: Sequence[VolSwaptionPoint]) -> dict[tup
     return out
 
 
-def _expiry_years_from_param(
-    row: ModelParamRow,
+def _build_swaption_sabr_interpolator(
     *,
+    model_param_rows: Sequence[ModelParamRow],
+    vol_points: Sequence[VolSwaptionPoint],
     as_of: date,
-    daycount: str,
-) -> Optional[float]:
-    if row.x_years is not None:
-        return float(row.x_years)
-    if row.expiry_date is not None:
-        return float(year_fraction(as_of, row.expiry_date, daycount))
-    if row.expiry_tenor is not None:
-        resolved = add_tenor(as_of, parse_tenor(row.expiry_tenor))
-        return float(year_fraction(as_of, resolved, daycount))
-    return None
+    pricing: SwaptionPricingInput,
+    sabr_interpolation_spec: SabrInterpolationSpec,
+    forward_rate_index_key: str,
+) -> SwaptionAtmSabrInterpolator:
+    if pricing.pricing_model is None:
+        raise ValueError("pricing_model must be resolved before building SABR interpolator.")
+    if pricing.vol_interp_model is None:
+        raise ValueError("vol_interp_model must be resolved before building SABR interpolator.")
+    model = _normalize_pricing_model(pricing.pricing_model)
+    vol_interp_model = _normalize_vol_interp_model(pricing.vol_interp_model)
+    match vol_interp_model:
+        case SwaptionVolInterpModel.SHIFTED_SABR:
+            pass
+        case _:
+            raise ValueError(f"Unsupported swaption vol_interp_model: {pricing.vol_interp_model!r}")
+    sabr_vol_type = _sabr_vol_type_for_model(model)
+    vol_shift_surface = _build_vol_shift_surface(vol_points)
+    return SwaptionAtmSabrInterpolator(
+        model_param_rows,
+        as_of=as_of,
+        daycount=pricing.forward_daycount,
+        vol_type=sabr_vol_type,
+        interpolation_spec=sabr_interpolation_spec,
+        vol_points=vol_points,
+        vol_shift_surface=vol_shift_surface,
+        forward_rate_index_key=forward_rate_index_key,
+    )
 
 
-def _swap_years_from_param(row: ModelParamRow) -> Optional[float]:
-    if row.swap_tenor is None:
-        return None
-    return _tenor_to_years(row.swap_tenor)
+def _swaption_sabr_cache_key(
+    *,
+    snapshot_id: str,
+    as_of: date,
+    ccy: str,
+    ref_rate_id: str,
+    index_tenor: str,
+    pricing: SwaptionPricingInput,
+) -> tuple[str, ...]:
+    if pricing.model_tag is None:
+        raise ValueError("model_tag must be resolved before building SABR cache key.")
+    if pricing.pricing_model is None:
+        raise ValueError("pricing_model must be resolved before building SABR cache key.")
+    if pricing.vol_interp_model is None:
+        raise ValueError("vol_interp_model must be resolved before building SABR cache key.")
+    if pricing.vol_quote_type is None:
+        raise ValueError("vol_quote_type must be resolved before building SABR cache key.")
+    return (
+        snapshot_id,
+        as_of.isoformat(),
+        ccy,
+        ref_rate_id,
+        index_tenor,
+        pricing.model_tag,
+        pricing.pricing_model,
+        pricing.vol_interp_model,
+        pricing.vol_quote_type,
+        "" if pricing.surface_tag is None else pricing.surface_tag,
+        pricing.forward_daycount,
+    )
 
 
 def _round_years(x: float) -> float:
     return round(float(x), 12)
-
-
-def _build_interp_2d_cache(nodes: Sequence[_ParamNode]) -> Optional[_Interp2DCache]:
-    if not nodes:
-        return None
-
-    by_y: dict[float, list[tuple[float, float]]] = {}
-    for n in nodes:
-        by_y.setdefault(_round_years(n.swap_years), []).append((_round_years(n.expiry_years), n.value))
-
-    y_axis = np.array(sorted(by_y.keys()), dtype=float)
-    x_axes: list[np.ndarray] = []
-    v_axes: list[np.ndarray] = []
-    for i, y_key in enumerate(y_axis):
-        pairs = sorted(by_y[float(y_key)], key=lambda p: p[0])
-        dedup: dict[float, float] = {}
-        for px, pv in pairs:
-            dedup[px] = pv
-        x_sorted = sorted(dedup.keys())
-        x_axes.append(np.asarray(x_sorted, dtype=float))
-        v_axes.append(np.asarray([dedup[k] for k in x_sorted], dtype=float))
-    return _Interp2DCache(y_axis=y_axis, x_axes=tuple(x_axes), v_axes=tuple(v_axes))
 
 
 def _irr_settlement_annuity(
@@ -549,90 +539,6 @@ def _irr_settlement_annuity(
         df /= den
         annuity += float(alpha) * df
     return float(annuity)
-
-
-class _SwaptionParamResolver:
-    def __init__(
-        self,
-        rows: Sequence[ModelParamRow],
-        *,
-        as_of: date,
-        daycount: str,
-        vol_shift_surface: dict[tuple[float, float], float],
-    ) -> None:
-        self._base: dict[str, tuple[int, float]] = {}
-        self._nodes: dict[str, list[_ParamNode]] = {}
-        self._interp_cache: dict[str, _Interp2DCache] = {}
-        vol_shift_nodes: list[_ParamNode] = [
-            _ParamNode(expiry_years=k[0], swap_years=k[1], value=v)
-            for k, v in vol_shift_surface.items()
-        ]
-        self._vol_shift_cache = _build_interp_2d_cache(vol_shift_nodes)
-
-        best_per_node: dict[str, dict[tuple[float, float], tuple[int, float]]] = {}
-        for row in rows:
-            name = row.param_name.lower()
-            if name not in {"alpha", "beta", "rho", "nu", "shift"}:
-                continue
-            scope_rank = _scope_rank(row.scope)
-            expiry = _expiry_years_from_param(row, as_of=as_of, daycount=daycount)
-            swap_years = _swap_years_from_param(row)
-            value = float(row.param_val)
-
-            if expiry is None or swap_years is None:
-                prev = self._base.get(name)
-                if prev is None or scope_rank >= prev[0]:
-                    self._base[name] = (scope_rank, value)
-                continue
-
-            key = (_round_years(expiry), _round_years(swap_years))
-            per_name = best_per_node.setdefault(name, {})
-            prev = per_name.get(key)
-            if prev is None or scope_rank >= prev[0]:
-                per_name[key] = (scope_rank, value)
-
-        for name, keyed in best_per_node.items():
-            self._nodes[name] = [
-                _ParamNode(expiry_years=k[0], swap_years=k[1], value=v[1])
-                for k, v in keyed.items()
-            ]
-            cache = _build_interp_2d_cache(self._nodes[name])
-            if cache is not None:
-                self._interp_cache[name] = cache
-
-    def _select(self, name: str, *, expiry: float, swap_years: float) -> Optional[float]:
-        cache = self._interp_cache.get(name)
-        if cache is not None:
-            return cache.evaluate(expiry=expiry, swap_years=swap_years)
-        base = self._base.get(name)
-        if base is not None:
-            return base[1]
-        return None
-
-    def resolve(self, *, expiry: float, swap_years: float) -> SabrParams:
-        alpha = self._select("alpha", expiry=expiry, swap_years=swap_years)
-        beta = self._select("beta", expiry=expiry, swap_years=swap_years)
-        rho = self._select("rho", expiry=expiry, swap_years=swap_years)
-        nu = self._select("nu", expiry=expiry, swap_years=swap_years)
-        shift = self._select("shift", expiry=expiry, swap_years=swap_years)
-
-        if alpha is None or beta is None or rho is None or nu is None:
-            raise ValueError("model_param is missing SABR parameters: alpha/beta/rho/nu.")
-        if shift is None:
-            shift = (
-                None
-                if self._vol_shift_cache is None
-                else self._vol_shift_cache.evaluate(expiry=expiry, swap_years=swap_years)
-            )
-        if shift is None:
-            shift = 0.0
-        return SabrParams(
-            alpha=float(alpha),
-            beta=float(beta),
-            rho=float(rho),
-            nu=float(nu),
-            shift=float(shift),
-        )
 
 
 def _price_swaption_european(data: SwaptionPricingData) -> SwaptionPVResult:
@@ -670,28 +576,17 @@ def _price_swaption_european(data: SwaptionPricingData) -> SwaptionPVResult:
         year_fraction(swap_start, trade_swaption.swap_maturity, data.pricing.forward_daycount)
     )
 
-    vol_shift_surface = _build_vol_shift_surface(data.vol_points)
-    resolver = _SwaptionParamResolver(
-        data.model_param_rows,
-        as_of=as_of,
-        daycount=data.pricing.forward_daycount,
-        vol_shift_surface=vol_shift_surface,
-    )
-    sabr_params = resolver.resolve(expiry=expiry, swap_years=swap_years)
     if data.pricing.pricing_model is None:
         raise ValueError("pricing_model must be resolved before pricing.")
     if data.pricing.vol_interp_model is None:
         raise ValueError("vol_interp_model must be resolved before pricing.")
     model = _normalize_pricing_model(data.pricing.pricing_model)
-    vol_interp_model = _normalize_vol_interp_model(data.pricing.vol_interp_model)
-    match vol_interp_model:
-        case SwaptionVolInterpModel.SHIFTED_SABR:
-            pass
-        case _:
-            raise ValueError(
-                f"Unsupported swaption vol_interp_model: {data.pricing.vol_interp_model!r}"
-            )
     sabr_vol_type = _sabr_vol_type_for_model(model)
+    sabr_params = data.sabr_interpolator.resolve(
+        expiry=expiry,
+        swap_years=swap_years,
+        forward=forward_swap_rate,
+    )
 
     if expiry <= 0.0:
         sigma = 0.0
@@ -790,6 +685,9 @@ def load_swaption_pricing_data(
     trade_id: str,
     snapshot_id: str,
     pricing: SwaptionPricingInput,
+    sabr_interpolator_cache: Optional[
+        MutableMapping[tuple[str, ...], SwaptionAtmSabrInterpolator]
+    ] = None,
 ) -> SwaptionPricingData:
     trade = provider.get_trade(trade_id)
     pricing_eff = _resolve_effective_pricing_input(provider, trade=trade, pricing=pricing)
@@ -816,6 +714,10 @@ def load_swaption_pricing_data(
 
     if pricing_eff.model_tag is None:
         raise ValueError("model_tag must be resolved before loading swaption data.")
+    sabr_interpolation_spec = provider.get_sabr_interpolation_spec(
+        product=trade.product,
+        model_tag=pricing_eff.model_tag,
+    )
     global_rows = provider.get_model_params(
         snapshot_id=snapshot_id,
         model_tag=pricing_eff.model_tag,
@@ -834,6 +736,32 @@ def load_swaption_pricing_data(
         scope="INDEX",
         param_key=trade_swaption.swap_index_id,
     )
+    model_param_rows = tuple(global_rows) + tuple(ccy_rows) + tuple(index_rows)
+
+    cache_key = _swaption_sabr_cache_key(
+        snapshot_id=snapshot_id,
+        as_of=as_of,
+        ccy=trade_swaption.ccy,
+        ref_rate_id=trade_swaption.swap_index_id,
+        index_tenor=trade_swaption.swap_index_tenor,
+        pricing=pricing_eff,
+    )
+    sabr_interpolator = (
+        None
+        if sabr_interpolator_cache is None
+        else sabr_interpolator_cache.get(cache_key)
+    )
+    if sabr_interpolator is None:
+        sabr_interpolator = _build_swaption_sabr_interpolator(
+            model_param_rows=model_param_rows,
+            vol_points=vol_points,
+            as_of=as_of,
+            pricing=pricing_eff,
+            sabr_interpolation_spec=sabr_interpolation_spec,
+            forward_rate_index_key=trade_swaption.swap_index_id,
+        )
+        if sabr_interpolator_cache is not None:
+            sabr_interpolator_cache[cache_key] = sabr_interpolator
 
     fixed_calendar = provider.get_business_calendar(trade_swaption.swap_fixed_cal)
     float_calendar = provider.get_business_calendar(trade_swaption.swap_float_cal)
@@ -849,7 +777,9 @@ def load_swaption_pricing_data(
         discount_curve=discount_curve,
         forward_curve=forward_curve,
         vol_points=tuple(vol_points),
-        model_param_rows=tuple(global_rows) + tuple(ccy_rows) + tuple(index_rows),
+        model_param_rows=model_param_rows,
+        sabr_interpolation_spec=sabr_interpolation_spec,
+        sabr_interpolator=sabr_interpolator,
         pricing=pricing_eff,
         as_of=as_of,
         fixed_calendar=fixed_calendar,

@@ -3,6 +3,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from enum import Enum
 from typing import Iterable, Mapping, Optional, Sequence
+import warnings
 
 import numpy as np
 from scipy.optimize import least_squares  # type: ignore[import-untyped]
@@ -349,6 +350,26 @@ _UNPACK_BY_NAME = {
     "rho": _unpack_rho,
     "nu": _unpack_nu,
 }
+_BOUNDARY_WARN_TOL = 1e-6
+
+
+def _warn_if_near_boundary(params: SabrParams, *, context: str, tol: float = _BOUNDARY_WARN_TOL) -> None:
+    if params.alpha < tol:
+        warnings.warn(f"SABR alpha is near zero ({params.alpha:.6g}) at {context}.", RuntimeWarning, stacklevel=2)
+    if params.nu < tol:
+        warnings.warn(f"SABR nu is near zero ({params.nu:.6g}) at {context}.", RuntimeWarning, stacklevel=2)
+    if params.beta - 0.0 < tol or 1.0 - params.beta < tol:
+        warnings.warn(
+            f"SABR beta is near boundary [0,1] ({params.beta:.6g}) at {context}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
+    if params.rho - (-1.0) < tol or 1.0 - params.rho < tol:
+        warnings.warn(
+            f"SABR rho is near boundary (-1,1) ({params.rho:.6g}) at {context}.",
+            RuntimeWarning,
+            stacklevel=2,
+        )
 
 
 def _default_initial_guess(
@@ -438,6 +459,7 @@ def calibrate_sabr(
         shift=float(shift),
     )
     _validate_params(params_probe)
+    _warn_if_near_boundary(params_probe, context="calibration initial/fixed parameters")
 
     free_names = tuple(name for name in _PARAMETER_NAMES if name not in fixed)
     if len(free_names) == 0:
@@ -529,6 +551,7 @@ def calibrate_sabr(
         nu=calibrated_values[3],
         shift=float(shift),
     )
+    _warn_if_near_boundary(calibrated, context="calibration result")
     model_vols = model_kernel(
         shifted_forward,
         shifted_strikes,

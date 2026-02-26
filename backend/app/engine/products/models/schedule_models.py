@@ -251,6 +251,22 @@ class ModelParamRow:
 
 
 @dataclass(frozen=True)
+class SabrInterpolationSpec:
+    product: str
+    model_tag: str
+    beta_strategy: str  # FIXED / INTERPOLATE_LOGIT
+    beta_fixed_value: Optional[float] = None
+    nu_interp_transform: str = "LOG"
+    rho_interp_transform: str = "ATANH"
+    alpha_interp_mode: str = "TOTAL_VARIANCE_LINEAR"
+    alpha_solver: str = "NEWTON_WITH_BISECTION_FALLBACK"
+    alpha_cache_enabled: bool = True
+    newton_tol: float = 1e-12
+    newton_max_iter: int = 20
+    boundary_warn_tol: float = 1e-8
+
+
+@dataclass(frozen=True)
 class SwapScheduleRow:
     trade_id: str
     leg_id: str

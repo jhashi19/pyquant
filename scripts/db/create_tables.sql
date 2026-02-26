@@ -565,6 +565,8 @@ ON vol_capfloor(
 
 
 CREATE TABLE vol_swaption (
+  /** 実務ではvolatilityをATMとそのstrike差、ATMからのvolatility spreadとなっていることが一般的なようだが
+      テーブルに格納するときには絶対ボラとして格納するものとする。 **/
   vol_id         TEXT PRIMARY KEY,
   snapshot_id    TEXT NOT NULL REFERENCES market_snapshot(snapshot_id),
 
@@ -908,7 +910,7 @@ CREATE TABLE IF NOT EXISTS market_quote_swaption (
   )
 );
 
-CREATE INDEX IF NOT EXISTS ix_market_quote_swaption_surface
+CREATE INDEX IF NOT EXISTS ix_market_quote_swaption_cube
   ON market_quote_swaption(
     ccy, ref_rate_id, index_tenor, swap_tenor, quote_type, x_years
   );
@@ -1986,6 +1988,46 @@ CREATE TABLE IF NOT EXISTS pricing_model (
 
 CREATE INDEX IF NOT EXISTS ix_pricing_model_lookup
   ON pricing_model(profile_id, product, scope, scope_key);
+
+/* SABR補間運用設定（商品×モデルタグ）
+   - beta固定/補間の選択、補間変換、alphaソルバ設定を保持
+   - ATM-calibrated 補間の運用方針をコードから分離
+*/
+CREATE TABLE IF NOT EXISTS sabr_interpolation_config (
+  product                 TEXT NOT NULL REFERENCES m_trade_product(product),
+  model_tag               TEXT NOT NULL,
+
+  beta_strategy           TEXT NOT NULL CHECK (beta_strategy IN ('FIXED','INTERPOLATE_LOGIT')),
+  beta_fixed_value        REAL,
+
+  nu_interp_transform     TEXT NOT NULL DEFAULT 'LOG'
+                          CHECK (nu_interp_transform IN ('LOG')),
+  rho_interp_transform    TEXT NOT NULL DEFAULT 'ATANH'
+                          CHECK (rho_interp_transform IN ('ATANH')),
+  alpha_interp_mode       TEXT NOT NULL DEFAULT 'TOTAL_VARIANCE_LINEAR'
+                          CHECK (alpha_interp_mode IN ('TOTAL_VARIANCE_LINEAR','TOTAL_VARIANCE_BILINEAR')),
+  alpha_solver            TEXT NOT NULL DEFAULT 'NEWTON_WITH_BISECTION_FALLBACK'
+                          CHECK (alpha_solver IN ('NEWTON_WITH_BISECTION_FALLBACK')),
+  alpha_cache_enabled     INTEGER NOT NULL DEFAULT 1 CHECK (alpha_cache_enabled IN (0,1)),
+
+  newton_tol              REAL NOT NULL DEFAULT 1e-12 CHECK (newton_tol > 0.0),
+  newton_max_iter         INTEGER NOT NULL DEFAULT 20 CHECK (newton_max_iter > 0),
+  boundary_warn_tol       REAL NOT NULL DEFAULT 1e-8 CHECK (boundary_warn_tol > 0.0),
+
+  note                    TEXT,
+  created_at              TEXT NOT NULL DEFAULT (strftime('%Y-%m-%dT%H:%M:%fZ','now')),
+  updated_at              TEXT,
+
+  CHECK (
+    (beta_strategy='FIXED' AND beta_fixed_value IS NOT NULL AND beta_fixed_value >= 0.0 AND beta_fixed_value <= 1.0)
+    OR
+    (beta_strategy='INTERPOLATE_LOGIT' AND beta_fixed_value IS NULL)
+  ),
+  PRIMARY KEY (product, model_tag)
+);
+
+CREATE INDEX IF NOT EXISTS ix_sabr_interpolation_config_lookup
+  ON sabr_interpolation_config(product, model_tag);
 
 /* =========================
    シナリオ

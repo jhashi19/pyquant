@@ -7,8 +7,14 @@ import pytest
 from app.engine.market.yield_curve import YieldCurve
 from app.engine.math.bizday import BusinessCalendar
 from app.engine.math.daycount import year_fraction
-from app.engine.products.models.schedule_models import ModelParamRow, TradeHeader, TradeSwaption
+from app.engine.products.models.schedule_models import (
+    ModelParamRow,
+    SabrInterpolationSpec,
+    TradeHeader,
+    TradeSwaption,
+)
 from app.engine.products.pricing_model import PricingModelConfig
+from app.engine.products.sabr_interpolation import SwaptionAtmSabrInterpolator
 from app.engine.products.swaption import (
     MarketSnapshot,
     SwaptionDataProvider,
@@ -248,6 +254,19 @@ class _StubProvider(SwaptionDataProvider):
             ),
         )
 
+    def get_sabr_interpolation_spec(
+        self,
+        *,
+        product: str,
+        model_tag: str,
+    ) -> SabrInterpolationSpec:
+        return SabrInterpolationSpec(
+            product="SWAPTION",
+            model_tag=model_tag,
+            beta_strategy="FIXED",
+            beta_fixed_value=0.5,
+        )
+
 
 def data_factory(
     *,
@@ -332,3 +351,32 @@ def test_swaption_price_bachelier_branch_runs() -> None:
     out = price_swaption_from_data(data)
     assert np.isfinite(out.pv)
     assert np.isfinite(out.implied_vol)
+
+
+def test_swaption_load_reuses_sabr_interpolator_from_cache() -> None:
+    provider = _StubProvider()
+    pricing_input = SwaptionPricingInput(
+        discount_curve_id="USD_DISC",
+        forward_curve_id="USD_FWD",
+        discount_daycount="ACT/365F",
+        forward_daycount="ACT/365F",
+    )
+    cache: dict[tuple[str, ...], SwaptionAtmSabrInterpolator] = {}
+    data1 = load_swaption_pricing_data(
+        provider,
+        run_id="RUN_1",
+        trade_id="SWPT_1",
+        snapshot_id="SNAP_1",
+        pricing=pricing_input,
+        sabr_interpolator_cache=cache,
+    )
+    data2 = load_swaption_pricing_data(
+        provider,
+        run_id="RUN_2",
+        trade_id="SWPT_1",
+        snapshot_id="SNAP_1",
+        pricing=pricing_input,
+        sabr_interpolator_cache=cache,
+    )
+    assert len(cache) == 1
+    assert data1.sabr_interpolator is data2.sabr_interpolator

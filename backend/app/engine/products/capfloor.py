@@ -9,7 +9,6 @@ import numpy as np
 from scipy.special import ndtr  # type: ignore[import-untyped]
 
 from app.engine.market.sabr import (
-    SabrParams,
     SabrVolType,
     sabr_implied_vol,
 )
@@ -27,6 +26,7 @@ from app.engine.products.models.schedule_models import (
     LegScheduleSpec,
     ModelParamRow,
     RefRateRule,
+    SabrInterpolationSpec,
     TradeCapFloor,
     TradeHeader,
 )
@@ -34,11 +34,10 @@ from app.engine.products.pricing_model import (
     PricingModelConfig,
     resolve_pricing_model_config,
 )
-from app.engine.products.schedule_utils import add_tenor, build_leg_schedule, parse_tenor
+from app.engine.products.sabr_interpolation import CapFloorAtmSabrInterpolator
+from app.engine.products.schedule_utils import build_leg_schedule
 
 _VOL_FLOOR = 1e-10
-_STRIKE_TOL = 1e-12
-_MONEYNESS_TOL = 1e-12
 
 
 class CapFloorPricingModel(Enum):
@@ -103,6 +102,7 @@ class CapFloorPricingData:
     forward_curve: YieldCurve
     vol_points: tuple[VolCapFloorPoint, ...]
     model_param_rows: tuple[ModelParamRow, ...]
+    sabr_interpolation_spec: SabrInterpolationSpec
     schedule_rows: tuple[CapFloorScheduleRow, ...]
     fixings: tuple[HistoricalFixing, ...]
     pricing: CapFloorPricingInput
@@ -163,26 +163,12 @@ class CapFloorDataProvider(Protocol):
         product: str,
     ) -> Sequence[PricingModelConfig]: ...
 
-
-@dataclass(frozen=True)
-class _ParamCandidate:
-    value: float
-    scope_rank: int
-    expiry_years: Optional[float]
-    strike_rate: Optional[float]
-    moneyness: Optional[float]
-
-
-def _scope_rank(scope: str) -> int:
-    key = scope.upper()
-    if key == "GLOBAL":
-        return 0
-    if key == "CCY":
-        return 1
-    if key == "INDEX":
-        return 2
-    return -1
-
+    def get_sabr_interpolation_spec(
+        self,
+        *,
+        product: str,
+        model_tag: str,
+    ) -> SabrInterpolationSpec: ...
 
 def _normalize_pricing_model(pricing_model: str) -> CapFloorPricingModel:
     key = pricing_model.strip().upper()
@@ -202,6 +188,16 @@ def _normalize_vol_interp_model(vol_interp_model: str) -> CapFloorVolInterpModel
             return CapFloorVolInterpModel.SHIFTED_SABR
         case _:
             raise ValueError(f"Unsupported capfloor vol_interp_model: {vol_interp_model!r}")
+
+
+def _sabr_vol_type_for_model(model: CapFloorPricingModel) -> SabrVolType:
+    match model:
+        case CapFloorPricingModel.SHIFTED_BLACK:
+            return SabrVolType.LOGNORMAL
+        case CapFloorPricingModel.BACHELIER:
+            return SabrVolType.NORMAL
+        case _:
+            raise ValueError(f"Unsupported capfloor pricing_model: {model!r}")
 
 
 def _resolve_effective_pricing_input(
@@ -426,149 +422,6 @@ def _resolve_surface_fallback_shift(points: Iterable[VolCapFloorPoint]) -> Optio
     raise ValueError("vol_capfloor.sabr_shift must be consistent across the selected surface.")
 
 
-def _select_model_shift(
-    param_resolver: "_ModelParamResolver",
-    *,
-    expiry: float,
-    forward: float,
-) -> float:
-    shift_val = param_resolver.select_value("shift", expiry=expiry, strike=forward, forward=forward)
-    return 0.0 if shift_val is None else float(shift_val)
-
-
-def _node_anchor_date(
-    row: VolCapFloorPoint,
-    *,
-    as_of: date,
-) -> Optional[date]:
-    if row.expiry_date is not None:
-        return row.expiry_date
-    if row.expiry_tenor is not None:
-        return add_tenor(as_of, parse_tenor(row.expiry_tenor))
-    return None
-
-
-def _resolve_node_forward_rate(
-    rows: Sequence[VolCapFloorPoint],
-    *,
-    node_expiry: float,
-    as_of: date,
-    forward_curve: YieldCurve,
-    forward_daycount: str,
-    index_daycount: str,
-    index_tenor: str,
-) -> float:
-    if not rows:
-        raise ValueError("vol_capfloor rows are required for node forward calculation.")
-    anchor = _node_anchor_date(rows[0], as_of=as_of)
-    tenor = parse_tenor(index_tenor)
-
-    if anchor is not None:
-        start_date = anchor
-        end_date = add_tenor(start_date, tenor)
-        t_start = float(max(year_fraction(as_of, start_date, forward_daycount), 0.0))
-        t_end = float(max(year_fraction(as_of, end_date, forward_daycount), 0.0))
-        accrual = float(max(year_fraction(start_date, end_date, index_daycount), _VOL_FLOOR))
-    else:
-        tenor_end = add_tenor(as_of, tenor)
-        delta_fwd = float(max(year_fraction(as_of, tenor_end, forward_daycount), _VOL_FLOOR))
-        delta_idx = float(max(year_fraction(as_of, tenor_end, index_daycount), _VOL_FLOOR))
-        t_start = float(max(node_expiry, 0.0))
-        t_end = t_start + delta_fwd
-        accrual = delta_idx
-
-    df_start = float(np.asarray(forward_curve.df(t_start)))
-    df_end = float(np.asarray(forward_curve.df(t_end)))
-    return float(forward_rate_from_dfs(df_start, df_end, accrual, Compounding.SIMPLE))
-
-
-def _node_vol_from_shifted_sabr(
-    *,
-    node_expiry: float,
-    node_forward: float,
-    strike_rate: float,
-    param_resolver: "_ModelParamResolver",
-    pricing_model: CapFloorPricingModel,
-) -> float:
-    params = param_resolver.resolve(
-        expiry=float(node_expiry),
-        strike=float(strike_rate),
-        forward=float(node_forward),
-    )
-    vol_type = SabrVolType.LOGNORMAL if pricing_model == CapFloorPricingModel.SHIFTED_BLACK else SabrVolType.NORMAL
-    return float(
-        np.asarray(
-            sabr_implied_vol(
-                np.asarray([strike_rate], dtype=float),
-                float(node_forward),
-                float(max(node_expiry, _VOL_FLOOR)),
-                params,
-                vol_type=vol_type,
-            ),
-            dtype=float,
-        )[0]
-    )
-
-
-def _build_sabr_node_grid(
-    grouped_rows: dict[float, list[VolCapFloorPoint]],
-    *,
-    as_of: date,
-    forward_curve: YieldCurve,
-    forward_daycount: str,
-    index_daycount: str,
-    index_tenor: str,
-) -> tuple[np.ndarray, np.ndarray]:
-    node_t = np.asarray(sorted(grouped_rows.keys()), dtype=float)
-    node_forward = np.empty_like(node_t, dtype=float)
-    for i, t in enumerate(node_t):
-        node_rows = grouped_rows[float(t)]
-        node_forward[i] = _resolve_node_forward_rate(
-            node_rows,
-            node_expiry=float(t),
-            as_of=as_of,
-            forward_curve=forward_curve,
-            forward_daycount=forward_daycount,
-            index_daycount=index_daycount,
-            index_tenor=index_tenor,
-        )
-    return node_t, node_forward
-
-
-def _build_node_vol_curve_shifted_sabr(
-    node_t: np.ndarray,
-    node_forward: np.ndarray,
-    *,
-    strike_rate: float,
-    param_resolver: "_ModelParamResolver",
-    pricing_model: CapFloorPricingModel,
-) -> np.ndarray:
-    node_v = np.empty_like(node_t, dtype=float)
-    for i in range(node_t.size):
-        t = float(node_t[i])
-        node_v[i] = _node_vol_from_shifted_sabr(
-            node_expiry=t,
-            node_forward=float(node_forward[i]),
-            strike_rate=strike_rate,
-            param_resolver=param_resolver,
-            pricing_model=pricing_model,
-        )
-    return node_v
-
-
-def _interp_node_vol_curve(
-    node_t: np.ndarray,
-    node_v: np.ndarray,
-    *,
-    expiry: float,
-) -> float:
-    if expiry <= node_t[0]:
-        return float(node_v[0])
-    if expiry >= node_t[-1]:
-        return float(node_v[-1])
-    return float(np.interp(expiry, node_t, node_v))
-
-
 def _shifted_black_optionlet_value(
     forward_rate: float,
     strike_rate: float,
@@ -669,158 +522,6 @@ def _is_call(cp_flag: str) -> bool:
     raise ValueError("trade_capfloor.cp_flag must be 'C' or 'P'.")
 
 
-def _expiry_years_from_row(
-    row: ModelParamRow,
-    *,
-    as_of: date,
-    forward_daycount: str,
-) -> Optional[float]:
-    if row.x_years is not None:
-        return float(row.x_years)
-    if row.expiry_date is not None:
-        return float(year_fraction(as_of, row.expiry_date, forward_daycount))
-    if row.expiry_tenor is not None:
-        maturity = add_tenor(as_of, parse_tenor(row.expiry_tenor))
-        return float(year_fraction(as_of, maturity, forward_daycount))
-    return None
-
-
-def _build_param_candidates(
-    rows: Iterable[ModelParamRow],
-    *,
-    as_of: date,
-    forward_daycount: str,
-) -> dict[str, tuple[_ParamCandidate, ...]]:
-    grouped: dict[str, list[_ParamCandidate]] = {}
-    for row in rows:
-        name = row.param_name.lower()
-        if name not in {"alpha", "beta", "rho", "nu", "shift"}:
-            continue
-        candidate = _ParamCandidate(
-            value=float(row.param_val),
-            scope_rank=_scope_rank(row.scope),
-            expiry_years=_expiry_years_from_row(
-                row,
-                as_of=as_of,
-                forward_daycount=forward_daycount,
-            ),
-            strike_rate=(None if row.strike_rate is None else float(row.strike_rate)),
-            moneyness=(None if row.moneyness is None else float(row.moneyness)),
-        )
-        grouped.setdefault(name, []).append(candidate)
-    return {k: tuple(v) for k, v in grouped.items()}
-
-
-def _build_base_params(candidates: dict[str, tuple[_ParamCandidate, ...]]) -> dict[str, float]:
-    out: dict[str, float] = {}
-    for name, rows in candidates.items():
-        best_scope = -1
-        best_value: Optional[float] = None
-        for row in rows:
-            if row.expiry_years is not None or row.strike_rate is not None or row.moneyness is not None:
-                continue
-            if row.scope_rank >= best_scope:
-                best_scope = row.scope_rank
-                best_value = row.value
-        if best_value is not None:
-            out[name] = best_value
-    return out
-
-
-class _ModelParamResolver:
-    def __init__(
-        self,
-        rows: Iterable[ModelParamRow],
-        *,
-        as_of: date,
-        forward_daycount: str,
-        fallback_shift: Optional[float],
-    ) -> None:
-        self._candidates = _build_param_candidates(
-            rows,
-            as_of=as_of,
-            forward_daycount=forward_daycount,
-        )
-        self._base = _build_base_params(self._candidates)
-        self._fallback_shift = fallback_shift
-
-    def _select(
-        self,
-        name: str,
-        *,
-        expiry: float,
-        strike: float,
-        forward: float,
-    ) -> Optional[float]:
-        rows = self._candidates.get(name)
-        if not rows:
-            return self._base.get(name)
-
-        best_score: Optional[tuple[int, int, float, float]] = None
-        best_value: Optional[float] = None
-        for row in rows:
-            if row.strike_rate is not None and abs(row.strike_rate - strike) > _STRIKE_TOL:
-                continue
-            if row.moneyness is not None and abs(row.moneyness - (strike - forward)) > _MONEYNESS_TOL:
-                continue
-
-            expiry_distance = (
-                abs(expiry - row.expiry_years) if row.expiry_years is not None else float("inf")
-            )
-            strike_distance = (
-                abs(strike - row.strike_rate)
-                if row.strike_rate is not None
-                else (abs((strike - forward) - row.moneyness) if row.moneyness is not None else float("inf"))
-            )
-            axis_specificity = int(row.expiry_years is not None) + int(
-                row.strike_rate is not None or row.moneyness is not None
-            )
-            score = (row.scope_rank, axis_specificity, -expiry_distance, -strike_distance)
-            if best_score is None or score > best_score:
-                best_score = score
-                best_value = row.value
-
-        if best_value is not None:
-            return best_value
-        return self._base.get(name)
-
-    def select_value(
-        self,
-        name: str,
-        *,
-        expiry: float,
-        strike: float,
-        forward: float,
-    ) -> Optional[float]:
-        return self._select(name, expiry=expiry, strike=strike, forward=forward)
-
-    def resolve(
-        self,
-        *,
-        expiry: float,
-        strike: float,
-        forward: float,
-    ) -> SabrParams:
-        alpha = self._select("alpha", expiry=expiry, strike=strike, forward=forward)
-        beta = self._select("beta", expiry=expiry, strike=strike, forward=forward)
-        rho = self._select("rho", expiry=expiry, strike=strike, forward=forward)
-        nu = self._select("nu", expiry=expiry, strike=strike, forward=forward)
-        shift = self._select("shift", expiry=expiry, strike=strike, forward=forward)
-
-        if alpha is None or beta is None or rho is None or nu is None:
-            raise ValueError("model_param is missing SABR parameters: alpha/beta/rho/nu.")
-        if shift is None:
-            shift = 0.0 if self._fallback_shift is None else float(self._fallback_shift)
-
-        return SabrParams(
-            alpha=float(alpha),
-            beta=float(beta),
-            rho=float(rho),
-            nu=float(nu),
-            shift=float(shift),
-        )
-
-
 def price_capfloor_from_data(data: CapFloorPricingData) -> CapFloorPVResult:
     if not data.schedule_rows:
         return CapFloorPVResult(pv=0.0, pv_future=0.0, pv_fixed=0.0, optionlet_count=0)
@@ -832,13 +533,21 @@ def price_capfloor_from_data(data: CapFloorPricingData) -> CapFloorPVResult:
         raise ValueError("vol_interp_model must be resolved before pricing.")
     pricing_model = _normalize_pricing_model(data.pricing.pricing_model)
     vol_interp_model = _normalize_vol_interp_model(data.pricing.vol_interp_model)
+    sabr_vol_type = _sabr_vol_type_for_model(pricing_model)
     grouped = _group_vol_points_by_expiry(data.vol_points, as_of=as_of)
     fallback_shift = _resolve_surface_fallback_shift(data.vol_points)
-    param_resolver = _ModelParamResolver(
+    param_resolver = CapFloorAtmSabrInterpolator(
         data.model_param_rows,
+        grouped_rows=grouped,
         as_of=as_of,
+        forward_curve=data.forward_curve,
         forward_daycount=data.pricing.forward_daycount,
+        index_daycount=data.ref_rate_rule.daycount,
+        index_tenor=data.trade_capfloor.index_tenor,
+        vol_type=sabr_vol_type,
+        interpolation_spec=data.sabr_interpolation_spec,
         fallback_shift=fallback_shift,
+        forward_rate_index_key=data.trade_capfloor.index_id,
     )
 
     fixing_map = _fixing_map(data.fixings)
@@ -858,15 +567,6 @@ def price_capfloor_from_data(data: CapFloorPricingData) -> CapFloorPVResult:
         dtype=float,
     )
     df_pay = np.asarray(data.discount_curve.df(pay_times), dtype=float)
-    node_t, node_forward = _build_sabr_node_grid(
-        grouped,
-        as_of=as_of,
-        forward_curve=data.forward_curve,
-        forward_daycount=data.pricing.forward_daycount,
-        index_daycount=data.ref_rate_rule.daycount,
-        index_tenor=data.trade_capfloor.index_tenor,
-    )
-    node_vol_cache: dict[float, np.ndarray] = {}
 
     pv_future = 0.0
     pv_fixed = 0.0
@@ -910,25 +610,25 @@ def price_capfloor_from_data(data: CapFloorPricingData) -> CapFloorPVResult:
             as_of=as_of,
             forward_daycount=data.pricing.forward_daycount,
         )
-        model_shift = _select_model_shift(param_resolver, expiry=expiry, forward=forward)
-        strike_key = float(strike)
-        node_v = node_vol_cache.get(strike_key)
-        if node_v is None:
-            match vol_interp_model:
-                case CapFloorVolInterpModel.SHIFTED_SABR:
-                    node_v = _build_node_vol_curve_shifted_sabr(
-                        node_t,
-                        node_forward,
-                        strike_rate=strike_key,
-                        param_resolver=param_resolver,
-                        pricing_model=pricing_model,
-                    )
-                case _:
-                    raise ValueError(
-                        f"Unsupported capfloor vol_interp_model: {data.pricing.vol_interp_model!r}"
-                    )
-            node_vol_cache[strike_key] = node_v
-        sigma = _interp_node_vol_curve(node_t, node_v, expiry=expiry)
+        match vol_interp_model:
+            case CapFloorVolInterpModel.SHIFTED_SABR:
+                sabr_params = param_resolver.resolve(expiry=expiry, forward=forward)
+                sigma = float(
+                    np.asarray(
+                        sabr_implied_vol(
+                            np.asarray([strike], dtype=float),
+                            forward,
+                            float(max(expiry, _VOL_FLOOR)),
+                            sabr_params,
+                            vol_type=sabr_vol_type,
+                        ),
+                        dtype=float,
+                    )[0]
+                )
+            case _:
+                raise ValueError(
+                    f"Unsupported capfloor vol_interp_model: {data.pricing.vol_interp_model!r}"
+                )
         match pricing_model:
             case CapFloorPricingModel.SHIFTED_BLACK:
                 optionlet = _shifted_black_optionlet_value(
@@ -936,7 +636,7 @@ def price_capfloor_from_data(data: CapFloorPricingData) -> CapFloorPVResult:
                     strike,
                     sigma,
                     expiry,
-                    shift=model_shift,
+                    shift=float(sabr_params.shift),
                     is_call=is_call,
                 )
             case CapFloorPricingModel.BACHELIER:
@@ -1038,6 +738,10 @@ def load_capfloor_pricing_data(
 
     if pricing_eff.model_tag is None:
         raise ValueError("model_tag must be resolved before loading capfloor data.")
+    sabr_interpolation_spec = provider.get_sabr_interpolation_spec(
+        product=trade.product,
+        model_tag=pricing_eff.model_tag,
+    )
     global_rows = provider.get_model_params(
         snapshot_id=snapshot_id,
         model_tag=pricing_eff.model_tag,
@@ -1068,6 +772,7 @@ def load_capfloor_pricing_data(
         forward_curve=forward_curve,
         vol_points=tuple(vol_points),
         model_param_rows=model_rows,
+        sabr_interpolation_spec=sabr_interpolation_spec,
         schedule_rows=schedule_rows,
         fixings=tuple(fixings),
         pricing=pricing_eff,

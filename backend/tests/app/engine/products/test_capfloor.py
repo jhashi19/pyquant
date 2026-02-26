@@ -20,6 +20,7 @@ from app.engine.products.models.schedule_models import (
     HistoricalFixing,
     ModelParamRow,
     RefRateRule,
+    SabrInterpolationSpec,
     TradeCapFloor,
     TradeHeader,
 )
@@ -285,6 +286,19 @@ class _StubProvider(CapFloorDataProvider):
                 vol_quote_type="LN_VOL",
                 surface_tag=None,
             ),
+        )
+
+    def get_sabr_interpolation_spec(
+        self,
+        *,
+        product: str,
+        model_tag: str,
+    ) -> SabrInterpolationSpec:
+        return SabrInterpolationSpec(
+            product="CAPFLOOR",
+            model_tag=model_tag,
+            beta_strategy="FIXED",
+            beta_fixed_value=0.5,
         )
 
 
